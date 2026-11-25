@@ -64,10 +64,6 @@
 
 - 早期版本参考了修狗TV（[xiugou-tv](https://github.com/qfw66/xiugou-tv)）的功能实现。
 - 参考了 FongMi （[FongMi/TV](https://github.com/FongMi/TV)）的功能实现。感谢这些项目及其贡献者长期的开源工作。
-- 弹幕匹配接口参考了自部署的 [danmu_api](https://github.com/qfw66/danmu_api)。
-- 播放基于 [media_kit](https://github.com/media-kit/media-kit)（libmpv）；部分兼容能力借助 [unidbg](https://github.com/zhkl0228/unidbg) 与 [dex2jar](https://github.com/pxb1988/dex2jar) 实现。
-
-安装目录的 `licenses/THIRD_PARTY_LICENSES.md` 列出第三方组件的来源与许可。
 
 ## 许可证
 

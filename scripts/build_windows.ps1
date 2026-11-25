@@ -1,0 +1,582 @@
+﻿<#
+.SYNOPSIS
+    小白TV Windows x64 Automated Build and Packaging Script.
+.DESCRIPTION
+    Compiles the Flutter Windows application in Release mode, collects all required
+    runtime dependencies (including MPV and Flutter plugins), and packages the output
+    into a portable ZIP archive and an Inno Setup installer executable.
+.PARAMETER Version
+    Product release version string (Default: read from pubspec.yaml).
+.PARAMETER FlutterPath
+    Custom path to Flutter SDK bin directory (e.g. 'D:\flutter\bin').
+.PARAMETER SkipZip
+    Skip generating the portable ZIP archive.
+.PARAMETER SkipInstaller
+    Skip compiling the Inno Setup installer.
+.PARAMETER SkipSmoke
+    跳过发布产物冒烟门禁（scripts/verify_release.ps1）。仅限本地调试打包；发布不得使用。
+.PARAMETER AllowMachineInstallCoexistence
+    允许门禁以 /CURRENTUSER 在临时目录测试；现有 HKLM 安装必须保持指纹不变，已有 HKCU 安装仍拒绝。
+.PARAMETER IncludeMdk
+    包含 MDK 运行库：要求显式配置 MDK SDK，校验完整运行库与通知。
+.PARAMETER BuildConfigFile
+    客户端编译配置路径。测试包和正式包同样要求 TMDB、弹幕和共享片段均已配置。
+.PARAMETER SignPfx
+    受信任 CA 代码签名证书（PFX）路径。留空则不签名——未签名 / 自签产物会被
+    360、Defender 等按「未验证发行者」启发式拦截。也可用环境变量 XIAOBAI_SIGN_PFX。
+.PARAMETER SignPassword
+    PFX 密码。也可用环境变量 XIAOBAI_SIGN_PASSWORD。
+.PARAMETER SignTimestamp
+    签名时间戳服务 URL（默认 Sectigo）。
+#>
+
+param (
+    [string]$Version = "",
+    [string]$FlutterPath = "",
+    [switch]$SkipZip = $false,
+    [switch]$SkipInstaller = $false,
+    [switch]$SkipSmoke = $false,
+    [switch]$AllowMachineInstallCoexistence = $false,
+    [Alias('LocalMdkPreview')][switch]$IncludeMdk = $false,
+    [string]$BuildConfigFile,
+    [string]$SignPfx = "",
+    [string]$SignPassword = "",
+    [string]$SignTimestamp = "http://timestamp.sectigo.com"
+)
+
+$ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = (Resolve-Path "$ScriptDir/..").Path
+$BuildOutputDir = "$ProjectRoot/build/windows/x64/runner/Release"
+$DistDir = "$ProjectRoot/dist"
+if ($IncludeMdk) {
+    if (!$env:XIAOBAI_MDK_SDK_DIR -or !(Test-Path -LiteralPath (Join-Path $env:XIAOBAI_MDK_SDK_DIR 'include/mdk/c/Player.h') -PathType Leaf)) {
+        throw 'MDK 构建需要 XIAOBAI_MDK_SDK_DIR 指向已验证的 MDK SDK。'
+    }
+}
+. (Join-Path $ScriptDir 'package_tree.ps1')
+. (Join-Path $ScriptDir 'client_build_config.ps1')
+if (!$BuildConfigFile) { $BuildConfigFile = Join-Path $ProjectRoot 'config/app.env' }
+$BuildConfigFile = (Resolve-Path -LiteralPath $BuildConfigFile).Path
+$clientConfig = Get-PackageClientConfig $BuildConfigFile
+$PowerShellExe = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+
+# 定位 signtool（Windows Kits 10，取版本号最新的 x64）。
+function Resolve-SignTool {
+    $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    if (-not (Test-Path $kitsRoot)) { return $null }
+    return Get-ChildItem $kitsRoot -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+# 解析本次构建要用的签名证书参数（命令行优先，其次环境变量）；未配置返回空。
+function Get-SignCertificate {
+    $pfx = $SignPfx
+    if (-not $pfx) { $pfx = $env:XIAOBAI_SIGN_PFX }
+    $pwd = $SignPassword
+    if (-not $pwd) { $pwd = $env:XIAOBAI_SIGN_PASSWORD }
+    if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) { return $null }
+    return @{ Pfx = $pfx; Password = $pwd }
+}
+
+function Sign-Authenticode {
+    param([Parameter(Mandatory = $true)][string]$File, [Parameter(Mandatory = $true)]$Cert)
+    $signtool = Resolve-SignTool
+    if (-not $signtool) { throw "未找到 signtool.exe（Windows Kits 10），无法签名。" }
+    $signArgs = @('sign', '/f', $Cert.Pfx, '/p', $Cert.Password,
+        '/tr', $SignTimestamp, '/td', 'sha256', '/fd', 'sha256', '/a', $File)
+    & $signtool @signArgs
+    if ($LASTEXITCODE -ne 0) { throw "签名失败: $File (exit $LASTEXITCODE)" }
+}
+
+# 对暂存目录根层的主程序与自研 / 引擎 DLL 做 Authenticode 签名；
+# companion/dist、runtime/jre 下的第三方运行时保留其官方签名，不重复签署。
+function Invoke-PackageSigning {
+    param([Parameter(Mandatory = $true)][string]$StageDir)
+
+    $cert = Get-SignCertificate
+    if (-not $cert) {
+        Write-Host "  [!] 未配置受信任代码签名证书：产物将以未验证发行者身份发布，易被 360 / Defender 启发式误报。" -ForegroundColor Yellow
+        Write-Host "      配置 -SignPfx <pfx> -SignPassword <pwd>（或环境变量 XIAOBAI_SIGN_PFX / XIAOBAI_SIGN_PASSWORD）后重试。" -ForegroundColor Yellow
+        return
+    }
+
+    $targets = New-Object 'System.Collections.Generic.List[string]'
+    $exe = Join-Path $StageDir $ShippedExeName
+    if (Test-Path $exe) { $targets.Add($exe) }
+    foreach ($dll in (Get-ChildItem -LiteralPath $StageDir -Filter '*.dll' -File)) {
+        $targets.Add($dll.FullName)
+    }
+
+    foreach ($target in $targets) {
+        Write-Host "  [sign] $(Split-Path $target -Leaf)" -ForegroundColor Cyan
+        Sign-Authenticode -File $target -Cert $cert
+    }
+}
+
+# 版本号默认跟随 pubspec.yaml（开发版本真源）；显式传 -Version 时以参数为准。
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $pubspecPath = Join-Path $ProjectRoot "pubspec.yaml"
+    $versionLine = Get-Content -LiteralPath $pubspecPath |
+        Where-Object { $_ -match '^\s*version:\s*\S+' } |
+        Select-Object -First 1
+    if ($versionLine -match '^\s*version:\s*(\d+\.\d+\.\d+)') {
+        $Version = $Matches[1]
+    } else {
+        throw "无法从 pubspec.yaml 解析版本号，请显式传 -Version x.y.z"
+    }
+}
+if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+    throw "版本号格式不合法：$Version（期望 x.y.z）"
+}
+
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "  小白TV Build & Packaging System" -ForegroundColor Cyan
+Write-Host "  Target: Windows x64 | Version: $Version" -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+
+# 1. Environment Check & Auto-discovery
+Write-Host "[1/5] Checking build environment..." -ForegroundColor Yellow
+
+$FlutterCmd = $null
+
+# Check custom path parameter
+if ($FlutterPath -ne "") {
+    $CustomFlutter = Join-Path $FlutterPath "flutter.bat"
+    if (Test-Path -LiteralPath $CustomFlutter -PathType Leaf) {
+        $FlutterCmd = (Resolve-Path -LiteralPath $CustomFlutter).ProviderPath
+        $env:Path = (Split-Path -Parent $FlutterCmd) + ";" + $env:Path
+        Write-Host "  [+] Using specified Flutter SDK: $FlutterPath" -ForegroundColor Green
+    } else {
+        throw "Flutter SDK not found at explicit path: $CustomFlutter"
+    }
+}
+
+# Check system PATH
+if (-not $FlutterCmd) {
+    $SysFlutter = Get-Command "flutter" -ErrorAction SilentlyContinue
+    if ($SysFlutter) {
+        $FlutterCmd = $SysFlutter.Source
+        Write-Host "  [+] Found Flutter SDK in PATH: $FlutterCmd" -ForegroundColor Green
+    }
+}
+
+# Auto scan candidate directories
+if (-not $FlutterCmd) {
+    $CandidateDirs = @(
+        "E:\resource\path\flutter\bin",
+        "C:\flutter\bin",
+        "D:\flutter\bin",
+        "E:\flutter\bin",
+        "F:\flutter\bin",
+        "C:\src\flutter\bin",
+        "D:\src\flutter\bin",
+        "E:\src\flutter\bin",
+        "$env:USERPROFILE\flutter\bin",
+        "$env:USERPROFILE\scoop\apps\flutter\current\bin",
+        "$env:LOCALAPPDATA\flutter\bin",
+        "$env:LOCALAPPDATA\Programs\flutter\bin",
+        "$env:ProgramFiles\flutter\bin",
+        "C:\tools\flutter\bin"
+    )
+
+    foreach ($dir in $CandidateDirs) {
+        $bat = Join-Path $dir "flutter.bat"
+        if (Test-Path $bat) {
+            $FlutterCmd = $bat
+            $env:Path = "$dir;" + $env:Path
+            Write-Host "  [+] Auto-discovered Flutter SDK at: $dir" -ForegroundColor Green
+            break
+        }
+    }
+}
+
+if (-not $FlutterCmd) {
+    Write-Host ""
+    Write-Host "[!] Flutter SDK not found in PATH or standard directories!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Solutions:" -ForegroundColor Yellow
+    Write-Host "1. Specify Flutter SDK path directly:" -ForegroundColor White
+    Write-Host "   powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1 -FlutterPath 'D:\path\to\flutter\bin'" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "2. Or set PATH temporarily in current session:" -ForegroundColor White
+    Write-Host "   `$env:Path = 'D:\path\to\flutter\bin;' + `$env:Path" -ForegroundColor Cyan
+    Write-Host "   powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "3. Or download Flutter SDK from official site:" -ForegroundColor White
+    Write-Host "   https://docs.flutter.dev/get-started/install/windows/desktop" -ForegroundColor Cyan
+    Write-Host ""
+    Exit 1
+}
+
+# 2. Dependency resolution
+Write-Host "[2/5] Resolving Flutter dependencies..." -ForegroundColor Yellow
+Set-Location $ProjectRoot
+& $FlutterCmd pub get
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "flutter pub get failed."
+}
+
+# 3. Release compilation
+Write-Host "[3/5] Building Windows x64 Release binary..." -ForegroundColor Yellow
+# 测试包和正式包使用同一套客户端配置；不把原始配置文件复制进包。
+$BuildArgs = @("build", "windows", "--release")
+# 关闭图标字体 tree-shaking：经函数参数 / Map / 三元传递的 IconData 不被静态追踪，
+# 裁剪子集可能漏掉这些图标导致运行时空白；改用完整字体（约 1.6 MB）保证不缺字形。
+$BuildArgs += "--no-tree-shake-icons"
+# 关于页「Build Time / Commit Hash」：打包时注入（工作区有已跟踪改动时哈希带 -dirty）
+$BuildTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$Commit = ""
+try {
+    $Commit = (& git -C $ProjectRoot rev-parse --short=8 HEAD 2>$null).Trim()
+    if ($Commit -and (& git -C $ProjectRoot status --porcelain --untracked-files=no 2>$null)) { $Commit = "$Commit-dirty" }
+} catch { $Commit = "" }
+$BuildArgs += "--dart-define=XIAOBAI_BUILD_TIME=$BuildTime"
+if ($Commit) { $BuildArgs += "--dart-define=XIAOBAI_COMMIT=$Commit" }
+Write-Host "      Build info: $BuildTime  $Commit" -ForegroundColor Gray
+$BuildArgs += "--dart-define-from-file=$BuildConfigFile"
+& $FlutterCmd @BuildArgs
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "flutter build windows --release failed."
+}
+
+if (-not (Test-Path -LiteralPath "$BuildOutputDir/xiaobai_tv.exe" -PathType Leaf)) {
+    Write-Error "Build output executable not found at: $BuildOutputDir/xiaobai_tv.exe"
+}
+Assert-PackageClientConfig $clientConfig (Join-Path $BuildOutputDir 'data/app.so')
+
+# 3.2 Icon font subset gate
+# release 构建默认 --tree-shake-icons，增量构建可能复用过期子集，导致新增图标运行时空白
+# （2026-10-18 实机事故：7 个图标缺失）。此处强制校验，缺失即失败。
+Write-Host "[3.2/5] Verifying icon font subset..." -ForegroundColor Yellow
+$IconFont = Join-Path $BuildOutputDir "data/flutter_assets/fonts/MaterialIcons-Regular.otf"
+$SourceRoot = Join-Path $ProjectRoot "lib"
+$IconChecker = Join-Path $ProjectRoot "scripts/check_icon_subset.py"
+if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
+    Write-Host "  [i] No lib/ source directory; skipping icon subset gate." -ForegroundColor DarkGray
+} elseif (-not (Test-Path -LiteralPath $IconFont -PathType Leaf)) {
+    throw "Icon font asset is missing: $IconFont"
+} else {
+    $IconChecked = $false
+    $PythonCmd = Get-Command "python" -ErrorAction SilentlyContinue
+    if ($PythonCmd -and (Test-Path -LiteralPath $IconChecker -PathType Leaf)) {
+        & $PythonCmd.Source $IconChecker "--project-root" $ProjectRoot
+        if ($LASTEXITCODE -eq 0) {
+            $IconChecked = $true
+            Write-Host "  [+] Icon font subset covers every referenced icon." -ForegroundColor Green
+        } elseif ($LASTEXITCODE -eq 1) {
+            throw "Icon font subset is stale: referenced icons are missing from $IconFont. Delete that file and rebuild."
+        } else {
+            Write-Host "  [!] Icon checker could not run (Flutter SDK icons.dart not found); using timestamp fallback." -ForegroundColor Yellow
+        }
+    }
+    if (-not $IconChecked) {
+        $FontTime = (Get-Item -LiteralPath $IconFont).LastWriteTimeUtc
+        $NewestSource = Get-ChildItem -LiteralPath $SourceRoot -Recurse -Filter "*.dart" -File |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        if ($NewestSource -and ($NewestSource.LastWriteTimeUtc -gt $FontTime)) {
+            throw "Icon font subset is stale: $($NewestSource.Name) is newer than $IconFont. Delete that file and rebuild."
+        }
+        Write-Host "  [+] Icon font timestamp is newer than every lib/*.dart (fallback check)." -ForegroundColor Green
+    }
+}
+
+# 3.1 Bundle Companion Service and Embedded Minimal JRE
+Write-Host "[3.1/5] Bundling Companion Service & Runtime..." -ForegroundColor Yellow
+
+$CompanionScript = Join-Path $ProjectRoot "companion/build.ps1"
+if (-not (Test-Path -LiteralPath $CompanionScript -PathType Leaf)) {
+    throw "Required Companion build script not found: $CompanionScript"
+}
+$EmbeddedJre = Join-Path $ProjectRoot "runtime/jre"
+foreach ($requiredRuntimeFile in @("bin/java.exe", "bin/server/jvm.dll")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $EmbeddedJre $requiredRuntimeFile) -PathType Leaf)) {
+        throw "Required embedded JRE file not found: $EmbeddedJre/$requiredRuntimeFile"
+    }
+}
+
+Write-Host "  [*] Building companion-service.jar..." -ForegroundColor Cyan
+# javac 的 lint 警告走 stderr；Stop 偏好会把它当成终止错误，这里临时降为 Continue，失败仍按退出码判断。
+$CompanionErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $CompanionScript 2>&1 | ForEach-Object { Write-Host $_ }
+$ErrorActionPreference = $CompanionErrorAction
+if ($LASTEXITCODE -ne 0) {
+    throw "Companion build failed with exit code $LASTEXITCODE."
+}
+
+$CompanionDist = Join-Path $ProjectRoot "companion/dist/companion-service.jar"
+if (-not (Test-Path -LiteralPath $CompanionDist -PathType Leaf)) {
+    throw "Companion build produced no JAR: $CompanionDist"
+}
+if ((Get-Item -LiteralPath $CompanionDist).Length -eq 0) {
+    throw "Companion JAR is empty: $CompanionDist"
+}
+$TargetCompanionRoot = Join-Path $BuildOutputDir "companion"
+$TargetCompanionDir = Join-Path $TargetCompanionRoot "dist"
+# invariant: 每次构建都从源目录重建 companion/dist，发布包里不允许出现上一轮的残留文件。
+# 只覆盖单个 jar 会把旧的 companion-service-<guid>.jar（每个 ~36 MB）、旧依赖一并留在原地，
+# 随后被 Compress-Archive 整包带走——684 MB 的便携包就是这么来的。
+$BuildOutputFull = [System.IO.Path]::GetFullPath($BuildOutputDir) + [System.IO.Path]::DirectorySeparatorChar
+$TargetCompanionRootFull = [System.IO.Path]::GetFullPath($TargetCompanionRoot)
+if (-not $TargetCompanionRootFull.StartsWith($BuildOutputFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Companion cleanup target is outside the release directory: $TargetCompanionRootFull"
+}
+if (Test-Path -LiteralPath $TargetCompanionRoot) {
+    Remove-Item -LiteralPath $TargetCompanionRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Path $TargetCompanionDir -Force | Out-Null
+Copy-Item -LiteralPath $CompanionDist -Destination $TargetCompanionDir -Force
+
+# 运行时依赖必须与 companion-service.jar 同级：AndroidBridge 按 jar 同目录找 BouncyCastle，
+# GuardPayloadProvisioner 按 dist/lib-unidbg 找解密依赖。缺任何一个都会让发布包在下游静默降级。
+$CompanionLibsDir = Join-Path $ProjectRoot "companion/libs"
+$CompanionLibJars = @(Get-ChildItem -LiteralPath $CompanionLibsDir -Filter "*.jar" -File -ErrorAction SilentlyContinue)
+if ($CompanionLibJars.Count -eq 0) {
+    throw "No runtime library JARs found: $CompanionLibsDir (AndroidBridge requires BouncyCastle beside the service JAR)."
+}
+$CompanionUnidbgDir = Join-Path $ProjectRoot "companion/lib-unidbg"
+$CompanionUnidbgJars = @(Get-ChildItem -LiteralPath $CompanionUnidbgDir -Filter "*.jar" -File -ErrorAction SilentlyContinue)
+if ($CompanionUnidbgJars.Count -eq 0) {
+    throw "No guard-decrypt JARs found: $CompanionUnidbgDir (guard sites would silently fall back to SpiderNull)."
+}
+foreach ($lib in $CompanionLibJars) {
+    Copy-Item -LiteralPath $lib.FullName -Destination $TargetCompanionDir -Force
+}
+$TargetUnidbgDir = Join-Path $TargetCompanionDir "lib-unidbg"
+New-Item -ItemType Directory -Path $TargetUnidbgDir -Force | Out-Null
+foreach ($lib in $CompanionUnidbgJars) {
+    Copy-Item -LiteralPath $lib.FullName -Destination $TargetUnidbgDir -Force
+}
+# py 源运行时（companion/build.ps1 产出到 companion/dist）：PyRuntime 按 jar 同级的 dist/pyshell、
+# dist/pyruntime 查找；缺失时会回退到 PATH 上的 python —— 只有开发机有，发布包里必须自带。
+foreach ($pyDir in @("pyshell", "pyruntime")) {
+    $sourcePyDir = Join-Path $ProjectRoot "companion/dist/$pyDir"
+    if (Test-Path -LiteralPath $sourcePyDir -PathType Container) {
+        Copy-Item -LiteralPath $sourcePyDir -Destination $TargetCompanionDir -Recurse -Force
+    } else {
+        throw "Companion build did not produce companion/dist/$pyDir (py sources would break in the release package)."
+    }
+}
+# 猫源由独立 Node 进程执行；发布包不得依赖开发机 PATH 或上一轮残留文件。
+$NodeRuntimeDir = Join-Path $ProjectRoot "companion/dist/noderuntime"
+foreach ($requiredNodeFile in @("node.exe", "LICENSE")) {
+    $requiredNodePath = Join-Path $NodeRuntimeDir $requiredNodeFile
+    if (-not (Test-Path -LiteralPath $requiredNodePath -PathType Leaf) -or
+        (Get-Item -LiteralPath $requiredNodePath).Length -eq 0) {
+        throw "Companion build did not produce noderuntime/$requiredNodeFile (cat sources require the bundled Node runtime)."
+    }
+}
+Copy-Item -LiteralPath $NodeRuntimeDir -Destination $TargetCompanionDir -Recurse -Force
+# PHP type:3 sources need their own interpreter; remote type:4 sources use HTTP.
+# 本地 PHP 运行时非必需：缺失时仅本地 type:3 PHP 源不可用（回退系统 PHP），
+# 远程 type:4 源走 HTTP 不受影响。与上一次发布包口径一致，不阻断打包。
+$PhpRuntimeDir = Join-Path $ProjectRoot 'companion/dist/phpruntime'
+if (Test-Path -LiteralPath $PhpRuntimeDir -PathType Container) {
+    Copy-Item -LiteralPath $PhpRuntimeDir -Destination $TargetCompanionDir -Recurse -Force
+} else {
+    Write-Host "  [!] 未携带本地 PHP 运行时：type:3 本地 PHP 源需要系统 PHP 8.3+；远程 type:4 源不受影响。" -ForegroundColor Yellow
+}
+$BundledCompanionFiles = @(Get-ChildItem -LiteralPath $TargetCompanionDir -Recurse -File)
+Write-Host "  [+] Bundled companion-service.jar + $($CompanionLibJars.Count) runtime lib(s) + $($CompanionUnidbgJars.Count) guard-decrypt lib(s) ($($BundledCompanionFiles.Count) files total)." -ForegroundColor Green
+
+Write-Host "  [*] Bundling embedded minimal JRE..." -ForegroundColor Cyan
+$TargetRuntimeDir = [System.IO.Path]::GetFullPath((Join-Path $BuildOutputDir "runtime"))
+$TargetJreDir = Join-Path $TargetRuntimeDir "jre"
+if (-not $TargetJreDir.StartsWith([System.IO.Path]::GetFullPath($BuildOutputDir) + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Runtime cleanup target is outside the release directory: $TargetJreDir"
+}
+if (Test-Path -LiteralPath $TargetJreDir) {
+    Remove-Item -LiteralPath $TargetJreDir -Recurse -Force
+}
+# invariant: 父目录必须已存在，避免 Copy-Item 将 jre 重命名为 runtime。
+New-Item -ItemType Directory -Path $TargetRuntimeDir -Force | Out-Null
+Copy-Item -LiteralPath $EmbeddedJre -Destination $TargetRuntimeDir -Recurse -Force
+Write-Host "  [+] Bundled embedded JRE to release directory." -ForegroundColor Green
+
+# 3.3 VC++ 运行库应用本地部署（issue #2：用户机未装 vc_redist 时报缺 VCRUNTIME140_1.dll、打不开）。
+# xiaobai_tv.exe 与各插件 DLL 以 /MD 链接 MSVCP140 / VCRUNTIME140 / VCRUNTIME140_1；Windows 先在 exe 目录
+# 找 DLL，因此随包放一份即可。来源优先取 VS 自带的可再发行目录（与编译器同版本），找不到才退回 System32。
+# 注意不要用 runtime/jre/bin 下的那份：版本 14.36 低于编译器，新编译器产物配旧 msvcp140 可能在加锁时崩溃。
+Write-Host "[3.3/5] Bundling VC++ runtime (app-local)..." -ForegroundColor Yellow
+$VcCrtFiles = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+$VcCrtSource = $null
+$VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+if (Test-Path -LiteralPath $VsWhere -PathType Leaf) {
+    foreach ($vsRoot in @(& $VsWhere -all -products * -property installationPath)) {
+        $redistRoot = Join-Path $vsRoot "VC/Redist/MSVC"
+        if (-not (Test-Path -LiteralPath $redistRoot)) { continue }
+        $versions = Get-ChildItem -LiteralPath $redistRoot -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+            Sort-Object { [version]$_.Name } -Descending
+        foreach ($ver in $versions) {
+            $crt = Get-ChildItem -LiteralPath (Join-Path $ver.FullName "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | Select-Object -First 1
+            if ($crt -and -not ($VcCrtFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $crt.FullName $_)) })) {
+                $VcCrtSource = $crt.FullName
+                break
+            }
+        }
+        if ($VcCrtSource) { break }
+    }
+}
+if (-not $VcCrtSource) {
+    $VcCrtSource = [Environment]::GetFolderPath('System')
+    Write-Host "  [!] VS redist directory not found; falling back to $VcCrtSource" -ForegroundColor Yellow
+}
+foreach ($crtFile in $VcCrtFiles) {
+    $crtPath = Join-Path $VcCrtSource $crtFile
+    if (-not (Test-Path -LiteralPath $crtPath -PathType Leaf)) { throw "VC++ runtime file not found: $crtPath" }
+    Copy-Item -LiteralPath $crtPath -Destination $BuildOutputDir -Force
+}
+$crtVersion = (Get-Item -LiteralPath (Join-Path $BuildOutputDir "msvcp140.dll")).VersionInfo.FileVersion
+Write-Host "  [+] Bundled $($VcCrtFiles -join ', ') ($crtVersion) from $VcCrtSource" -ForegroundColor Green
+
+# Ensure dist directory exists
+if (-not (Test-Path $DistDir)) {
+    New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
+}
+
+# One fresh application tree feeds ZIP, Inno, and the smoke comparison. Never
+# recursively copy Release: its user_data may contain the developer's real profile.
+# Keep the application license and versioned third-party notice with both distributions.
+Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENSE') -Destination (Join-Path $BuildOutputDir 'LICENSE') -Force
+$ReleaseLicenses = Join-Path $BuildOutputDir 'licenses'
+New-Item -ItemType Directory -Path $ReleaseLicenses -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $ProjectRoot 'THIRD_PARTY_LICENSES.md') -Destination $ReleaseLicenses -Force
+$FfmpegLicense = Join-Path $ProjectRoot 'licenses/FFmpeg-COPYING.LGPLv2.1'
+if (Test-Path -LiteralPath $FfmpegLicense) { Copy-Item -LiteralPath $FfmpegLicense -Destination $ReleaseLicenses -Force }
+$PackageStage = Join-Path $ProjectRoot ("build/packaging/" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $PackageStage -Force | Out-Null
+$ApplicationStage = New-StagedApplicationTree -SourceDir $BuildOutputDir -StageDir (Join-Path $PackageStage 'application') -IncludeMdk:$IncludeMdk
+$StagedAppDir = $ApplicationStage.Root
+$InnoFileList = Join-Path $PackageStage 'application-files.iss'
+Write-PackageInnoFileList -StageDir $StagedAppDir -DestinationPath $InnoFileList -IncludeMdk:$IncludeMdk
+Write-Host "  [+] Clean application stage: $StagedAppDir ($($ApplicationStage.Files.Count) files; $($ApplicationStage.Excluded.Count) state/cache/log paths excluded)." -ForegroundColor Green
+# 打 zip / 编译安装包之前签好根层主程序与自研 DLL；第三方运行时保持官方签名不动。
+Invoke-PackageSigning -StageDir $StagedAppDir
+$Artifacts = @()
+if (-not $SkipZip) {
+    Write-Host "[4/5] Packaging Portable ZIP archive..." -ForegroundColor Yellow
+    $ZipPath = Join-Path $PackageStage "xiaobai-tv-windows-x64-v$Version-portable.zip"
+
+    # 不用 Compress-Archive / ZipFile.CreateFromDirectory：在 Windows PowerShell 5.1（.NET Framework 兼容模式）下
+    # 两者都把条目路径写成反斜杠（runtime\jre\...），不符合 zip 规范（APPNOTE 4.4.17 要求 /），
+    # 部分解压工具会把整条路径当成文件名。这里逐个文件写入并显式用 / 作分隔。
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $ZipSourceRoot = $StagedAppDir
+    $ZipStream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::CreateNew)
+    try {
+        $ZipArchive = New-Object System.IO.Compression.ZipArchive($ZipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($entryName in $ApplicationStage.Files) {
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $ZipArchive, (Join-Path $ZipSourceRoot $entryName), $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        } finally { $ZipArchive.Dispose() }
+    } finally { $ZipStream.Dispose() }
+    $Artifacts += $ZipPath
+    Write-Host "  [+] Portable ZIP staged: $ZipPath" -ForegroundColor Green
+} else {
+    Write-Host "[4/5] Skipped Portable ZIP generation." -ForegroundColor DarkGray
+}
+
+# 5. Generate Inno Setup Installer
+if (-not $SkipInstaller) {
+    Write-Host "[5/5] Checking Inno Setup compiler (ISCC.exe)..." -ForegroundColor Yellow
+    $IsccCandidates = @(
+        "ISCC.exe",
+        "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe",
+        "${env:ProgramFiles}/Inno Setup 6/ISCC.exe",
+        "${env:LOCALAPPDATA}/Programs/Inno Setup 6/ISCC.exe"
+    )
+
+    $IsccPath = $null
+    foreach ($candidate in $IsccCandidates) {
+        if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+            $IsccPath = $candidate
+            break
+        }
+        if (Test-Path $candidate) {
+            $IsccPath = $candidate
+            break
+        }
+    }
+
+    if ($IsccPath) {
+        Write-Host "  [+] Running Inno Setup: $IsccPath" -ForegroundColor Cyan
+        & $IsccPath "/DAppVersion=$Version" "/DSourceDir=$StagedAppDir" "/DPackageFilesInclude=$InnoFileList" "/DOutputDir=$PackageStage" "$ScriptDir/installer.iss"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed with exit code $LASTEXITCODE."
+        }
+        $setupExe = Join-Path $PackageStage "xiaobai-tv-windows-x64-v$Version-setup.exe"
+        $setupCert = Get-SignCertificate
+        if ($setupCert) {
+            Write-Host "  [sign] $(Split-Path $setupExe -Leaf)" -ForegroundColor Cyan
+            Sign-Authenticode -File $setupExe -Cert $setupCert
+        }
+        $Artifacts += $setupExe
+    } else {
+        throw "ISCC.exe not found. Install Inno Setup or explicitly use -SkipInstaller."
+    }
+}
+
+# invariant: 所有本轮请求的产物就绪、且冒烟门禁通过前，不覆盖 dist 中的旧版本。
+foreach ($artifact in $Artifacts) {
+    if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+        throw "Build produced no artifact: $artifact"
+    }
+    if ((Get-Item -LiteralPath $artifact).Length -eq 0) {
+        throw "Build produced an empty artifact: $artifact"
+    }
+}
+# 客户端强制校验：Release 必须带 SHA256SUMS（或资产自带 digest），
+# 否则「检测更新」会拒绝安装。格式与 sha256sum 一致：<hex>  <filename>。
+# 先在暂存目录生成，门禁对暂存目录做自检，通过后与产物一起移入 dist。
+if ($Artifacts.Count -gt 0) {
+    $StageSums = Join-Path $PackageStage "SHA256SUMS"
+    $Sums = foreach ($artifact in $Artifacts) {
+        $name = [System.IO.Path]::GetFileName($artifact)
+        $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $name"
+    }
+    # invariant: 清单必须是 LF 换行，标准 `sha256sum -c` 才能直接消费；
+    # Set-Content 在 Windows PowerShell 下写 CRLF，会把回车符（CR）混进文件名。
+    $SumsText = (($Sums -join "`n") + "`n")
+    [System.IO.File]::WriteAllText($StageSums, $SumsText, [System.Text.Encoding]::ASCII)
+
+    # 发布产物冒烟门禁：必需文件、依赖闭包、版本资源、解压 / 静默安装后启动。任何一项失败即中止，
+    # dist 保持上一轮内容不变；失败现场留在暂存目录与门禁临时目录供排查。
+    if ($SkipSmoke) {
+        Write-Host "[6/6] Skipped release smoke gate (-SkipSmoke). Do NOT publish these artifacts." -ForegroundColor DarkYellow
+    } else {
+        Write-Host "[6/6] Running release smoke gate..." -ForegroundColor Yellow
+        $GateArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptDir "verify_release.ps1"),
+            "-Version", $Version, "-ArtifactDir", $PackageStage, "-StagedAppDir", $StagedAppDir, "-BuildConfigFile", $BuildConfigFile)
+        if ($SkipZip) { $GateArgs += "-SkipZip" }
+        if ($AllowMachineInstallCoexistence) { $GateArgs += '-AllowMachineInstallCoexistence' }
+        if ($IncludeMdk) { $GateArgs += '-IncludeMdk' }
+        if ($SkipInstaller) { $GateArgs += "-SkipInstaller" }
+        & $PowerShellExe @GateArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Release smoke gate FAILED (exit $LASTEXITCODE). Artifacts kept in $PackageStage; dist was not updated."
+        }
+    }
+
+    foreach ($artifact in ($Artifacts + $StageSums)) {
+        $destination = Join-Path $DistDir ([System.IO.Path]::GetFileName($artifact))
+        Move-Item -LiteralPath $artifact -Destination $destination -Force
+        Write-Host "  [+] Published: $destination" -ForegroundColor Green
+    }
+}
+if ($Artifacts.Count -eq 0) {
+    Write-Host "  [*] Release bundled only; no distribution artifacts requested." -ForegroundColor Yellow
+}
+
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "  Build completed successfully!" -ForegroundColor Green
+Write-Host "  Artifacts directory: $DistDir" -ForegroundColor Green
+Write-Host "======================================================" -ForegroundColor Cyan

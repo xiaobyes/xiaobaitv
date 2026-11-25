@@ -63,7 +63,7 @@
 本项目基于 GPL-3.0 的上游项目二次开发，并对界面与功能做了改造；下述上游项目的版权与许可归原作者所有，本工程整体以 GPL-3.0 发布，源码随仓提供。
 
 - 早期版本参考了修狗TV（[xiugou-tv](https://github.com/qfw66/xiugou-tv)）的功能实现。
-- 产品形态与交互参考了 FongMi 系列（[FongMi/TV](https://github.com/FongMi/TV)）以及 TVBox / CatVod 生态的既有实现，解析层遵循 CatVod spider 契约，以便直接运行既有插件。感谢这些项目及其贡献者长期的开源工作。
+- 参考了 FongMi （[FongMi/TV](https://github.com/FongMi/TV)）的功能实现。感谢这些项目及其贡献者长期的开源工作。
 - 弹幕匹配接口参考了自部署的 [danmu_api](https://github.com/qfw66/danmu_api)。
 - 播放基于 [media_kit](https://github.com/media-kit/media-kit)（libmpv）；部分兼容能力借助 [unidbg](https://github.com/zhkl0228/unidbg) 与 [dex2jar](https://github.com/pxb1988/dex2jar) 实现。
 

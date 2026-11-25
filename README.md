@@ -62,7 +62,7 @@
 
 本项目基于 GPL-3.0 的上游项目二次开发，并对界面与功能做了改造；下述上游项目的版权与许可归原作者所有，本工程整体以 GPL-3.0 发布，源码随仓提供。
 
-- 早期版本参考了修狗TV（[xiugou-tv](https://github.com/qfw66/xiugou-tv)）的功能实现。
+- 参考了修狗TV（[xiugou-tv](https://github.com/qfw66/xiugou-tv)）的功能实现。
 - 参考了 FongMi （[FongMi/TV](https://github.com/FongMi/TV)）的功能实现。
 - 感谢这些项目贡献者。
 

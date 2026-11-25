@@ -1,0 +1,3853 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import '../../../core/config/models/vod_config.dart';
+import '../../../core/danmaku/danmaku_controller.dart';
+import '../../../core/danmaku/danmaku_settings.dart';
+import '../../../core/danmaku/live_danmaku_models.dart';
+import '../../../core/player/decode_diagnostics.dart';
+import '../../../core/player/embedded_playback.dart';
+import '../../../core/player/models/player_settings.dart';
+import '../../../core/player/models/player_state.dart';
+import '../../../core/player/models/track_info.dart';
+import '../../../core/player/mpv_player_engine.dart';
+import '../../../core/player/playback_intent.dart';
+import '../../../core/player/seek_recovery_controller.dart';
+import '../../../core/segments/segment_models.dart';
+import '../../theme/app_palette.dart';
+import '../../theme/app_tokens.dart';
+import '../keyboard/player_shortcuts.dart';
+import 'danmaku_layer.dart';
+import 'danmaku_search_dialog.dart';
+import 'danmaku_settings_panel.dart';
+import 'episode_drawer.dart';
+import 'playback_preparing_overlay.dart';
+import '../widgets/focus_ring.dart';
+import '../dialogs/app_dialog.dart';
+import '../widgets/live_indicator.dart';
+import '../widgets/media_title_bar.dart';
+import '../window/desktop_window_manager.dart';
+import 'live_channel_drawer.dart';
+import 'live_danmaku_layer.dart';
+import 'native_playback_choices.dart';
+import 'playback_error_panel.dart';
+import 'player_osd_overlay.dart';
+import 'player_side_drawer.dart';
+import 'live_source_picker.dart';
+import 'playback_mode_badge.dart';
+import 'segment_panel.dart';
+import 'segment_runner.dart';
+import 'playback_source_nav.dart';
+import 'local_subtitle_picker.dart';
+import 'subtitle_scale_menu.dart';
+
+export 'playback_source_nav.dart';
+
+// ---- 播放器控制层（顶部 / 底部）恒定深色 chrome ----
+//
+// 控制层遮罩与前景与主题解耦（视频播放器惯例：控制层恒深、前景恒浅）。
+// 浅色主题下若沿用主题色，会出现「白色渐变盖住画面 + 深色文字压深底」的
+// 错位观感（用户实机反馈）。固定值取深色主题的对应色。
+// 刻意固定色：调整前先确认控制层遮罩仍为深色。
+const Color _chromeScrim = Color(0xCC000000); // 顶 / 底遮罩主色
+const Color _chromeScrimFade = Color(0x00000000); // 遮罩渐隐端
+const Color _chromeInk = Color(0xFFFFFFFF); // 控制层前景（文字 / 图标 / 滑条）
+const Color _chromeHighlight = Color(0xFF94A3B8); // 高亮（已设态 / 已播进度）
+const Color _chromeTrack = Color(0xFF2E2E3C); // 滑条未播 / 未满轨道
+const Color _chromeBadge = Color(0xFF414A5B); // 徽章底（HW 标识）
+///
+/// 控制条按钮统一点击盒尺寸（36×36）。
+///
+/// 纯图标 / 图标+文字 / 纯文字入口都占同一个方盒：图标中心 = 盒中心 =
+/// 控制行中线，点击区高度因此天然一致（实机反馈「水平高度不符」）。
+const double _controlHitSize = 36;
+
+/// 画面缩放模式 → 视频纹理适配方式（比例强制由 mpv `video-aspect-override` 负责）。
+BoxFit videoFitForScale(String scale) => switch (scale) {
+      'fill' => BoxFit.fill,
+      'crop' => BoxFit.cover,
+      _ => BoxFit.contain,
+    };
+
+/// §43 弹幕视图模型（由宿主装配：加载 / 缓存 / 取消都在宿主的 [DanmakuController]）。
+class PlayerDanmakuNav {
+  const PlayerDanmakuNav({
+    required this.state,
+    required this.enabled,
+    required this.onToggle,
+    this.settings = DanmakuSettings.defaults,
+    this.onSettingsChanged,
+    this.searchController,
+  });
+
+  /// 播放页「弹幕设置」抽屉里改了设置（宿主负责落盘）；为 null 时不显示该入口。
+  final ValueChanged<DanmakuSettings>? onSettingsChanged;
+
+  /// 外观与屏蔽（设置页「弹幕」分组，实时生效）
+  final DanmakuSettings settings;
+
+  /// 加载状态（含已解析的弹幕轨）
+  final ValueListenable<DanmakuState> state;
+
+  /// 当前播放是否显示弹幕
+  final bool enabled;
+
+  /// 「弹」按钮 / D 键
+  final VoidCallback onToggle;
+
+  /// 宿主传同一个控制器，播放页才有「搜索弹幕」入口（手动换源）；
+  /// 为 null 时不显示该按钮（例如宿主还没接上手动搜索）。
+  final DanmakuController? searchController;
+}
+
+/// 实时弹幕由宿主管理连接；消息流只承载聊天，状态通过 [state] 单独通知。
+@immutable
+class PlayerLiveDanmakuNav {
+  const PlayerLiveDanmakuNav({
+    required this.messages,
+    required this.enabled,
+    required this.settings,
+    required this.onToggle,
+    required this.onSettingsChanged,
+    required this.state,
+    required this.status,
+    required this.error,
+  });
+
+  final Stream<List<LiveDanmakuMessage>> messages;
+  final ValueListenable<bool> enabled;
+  final ValueListenable<DanmakuSettings> settings;
+  final VoidCallback onToggle;
+  final ValueChanged<DanmakuSettings> onSettingsChanged;
+  final Listenable state;
+  final LiveDanmakuStatus Function() status;
+  final String? Function() error;
+}
+
+/// 播放器内切集视图模型（由宿主装配；组件保持哑视图，切换逻辑不在组件内）。
+class PlayerEpisodeNav {
+  /// 是否可切到上一集（首集为 false → 按钮禁用）。
+  final bool canPrev;
+
+  /// 是否可切到下一集（末集为 false → 按钮禁用）。
+  final bool canNext;
+
+  /// 切换进行中：两个按钮一并禁用，防重复触发。
+  final bool switching;
+
+  final VoidCallback onPrevEpisode;
+  final VoidCallback onNextEpisode;
+
+  const PlayerEpisodeNav({
+    required this.canPrev,
+    required this.canNext,
+    this.switching = false,
+    required this.onPrevEpisode,
+    required this.onNextEpisode,
+  });
+}
+
+/// 播放器内刷新视图模型（由宿主装配；组件保持哑视图，刷新逻辑不在组件内）。
+class PlayerRefreshNav {
+  /// 刷新进行中：按钮禁用并吸收点击。
+  final bool busy;
+
+  final VoidCallback onRefresh;
+
+  const PlayerRefreshNav({required this.busy, required this.onRefresh});
+}
+
+/// 播放器内片头 / 片尾视图模型（由宿主装配；0 表示未设置）。
+///
+/// 写入语义：`onSetOpeningAt` / `onSetEndingAt` 接收**绝对时间点**（毫秒），
+/// 片尾的「距片尾偏移」换算、范围与重叠校验、持久化都在宿主完成；
+/// 组件只负责触发，不落任何盘。
+class PlayerSkipNav {
+  final int openingMs;
+  final int endingMs;
+
+  /// 片头片尾总开关；关闭时「跳过片头」胶囊不应出现。
+  final bool enabled;
+
+  /// 设为片头 / 片尾（参数为绝对时间点毫秒）。
+  final ValueChanged<int> onSetOpeningAt;
+  final ValueChanged<int> onSetEndingAt;
+
+  /// 清除片头 / 片尾标记。
+  final VoidCallback onClearOpening;
+  final VoidCallback onClearEnding;
+
+  const PlayerSkipNav({
+    this.openingMs = 0,
+    this.endingMs = 0,
+    this.enabled = true,
+    required this.onSetOpeningAt,
+    required this.onSetEndingAt,
+    required this.onClearOpening,
+    required this.onClearEnding,
+  });
+}
+
+/// 播放器内重播视图模型（由宿主装配；为空时隐藏重播按钮）。
+class PlayerReplayNav {
+  /// 切换 / 刷新进行中：重播禁用，避免与启动链路竞争。
+  final bool busy;
+  final VoidCallback onReplay;
+
+  const PlayerReplayNav({required this.busy, required this.onReplay});
+}
+
+/// 播放器内视频轨视图模型（由宿主装配；为空时不显示「视轨」）。
+///
+/// 通过可选能力接口从真实引擎装配，测试替身不提供该视图模型即自动隐藏入口。
+class PlayerVideoTracksNav {
+  final List<TrackInfo> tracks;
+  final Stream<List<TrackInfo>> tracksStream;
+  final Future<void> Function(TrackInfo track) onSelect;
+
+  /// 当前是否处于「关闭视频」状态（mpv `vid=no`）。
+  final bool isDisabled;
+
+  const PlayerVideoTracksNav({
+    required this.tracks,
+    required this.tracksStream,
+    required this.onSelect,
+    this.isDisabled = false,
+  });
+}
+
+/// 播放器内音轨视图模型（由宿主装配；为空时不显示「音轨」）。
+class PlayerAudioTracksNav {
+  final List<TrackInfo> Function() _readTracks;
+  List<TrackInfo> get tracks => _readTracks();
+  final Stream<List<TrackInfo>> tracksStream;
+  final Future<void> Function(TrackInfo track) onSelect;
+
+  const PlayerAudioTracksNav({
+    required List<TrackInfo> Function() readTracks,
+    required this.tracksStream,
+    required this.onSelect,
+  }) : _readTracks = readTracks;
+}
+
+/// 播放器内字幕视图模型（由宿主装配；为空时不显示「字幕」）。
+class PlayerSubtitleTracksNav {
+  final List<TrackInfo> Function() _readTracks;
+  List<TrackInfo> get tracks => _readTracks();
+  final Stream<List<TrackInfo>> tracksStream;
+  final Future<void> Function(TrackInfo track) onSelect;
+
+  /// 关闭字幕；为空时不显示「关闭字幕」项。
+  final Future<void> Function()? onDisable;
+
+  final int? Function()? readSession;
+  final bool Function()? canScale;
+  final double Function()? readScale;
+  final Future<bool> Function(double factor)? onSetScale;
+  final Future<bool> Function(String path, {required int session})? onLoadLocal;
+  final SubtitleFilePicker? filePicker;
+
+  const PlayerSubtitleTracksNav({
+    required List<TrackInfo> Function() readTracks,
+    required this.tracksStream,
+    required this.onSelect,
+    this.onDisable,
+    this.readSession,
+    this.canScale,
+    this.readScale,
+    this.onSetScale,
+    this.onLoadLocal,
+    this.filePicker,
+  }) : _readTracks = readTracks;
+}
+
+/// 播放器内重置视图模型（由宿主装配；为空时不显示「重置」）。
+class PlayerResetNav {
+  /// 切换 / 刷新进行中：重置禁用，避免与启动链路竞争。
+  final bool enabled;
+  final Future<void> Function() onReset;
+
+  const PlayerResetNav({this.enabled = true, required this.onReset});
+}
+
+/// 播放器内「线路」分组里的一条线路。
+class PlayerLineOption {
+  /// `session.sources` 的下标（选项可能因缺集而跳号，不能用列表位置代替）。
+  final int index;
+  final String name;
+
+  /// 当前正在播放的线路（显示勾选、不可点）。
+  final bool current;
+
+  /// 本次会话里已尝试并失败的线路（灰显、不可点）。
+  /// 确认失败（解析为空 / 启动抛错）；只是「用过」不算。
+  final bool unavailable;
+
+  const PlayerLineOption({
+    required this.index,
+    required this.name,
+    this.current = false,
+    this.unavailable = false,
+  });
+}
+
+/// 播放器内线路视图模型（SET-12 重做；由宿主装配，组件保持哑视图）。
+///
+/// 只有一条线路时宿主应传 null，面板不显示「线路」分组。
+class PlayerLineNav {
+  final List<PlayerLineOption> options;
+
+  /// 换线 / 刷新 / 切集进行中：全部线路不可点。
+  final bool busy;
+
+  /// `index` 是 `session.sources` 的下标（不是 options 的下标）。
+  final void Function(int index) onSelect;
+
+  const PlayerLineNav({
+    required this.options,
+    required this.busy,
+    required this.onSelect,
+  });
+}
+
+/// 从真实 mpv 引擎装配三个轨道视图模型（宿主使用；测试可用假引擎直接验证接线）。
+({
+  PlayerAudioTracksNav audio,
+  PlayerSubtitleTracksNav subtitle,
+  PlayerVideoTracksNav video,
+}) buildPlayerTrackNavs(MpvPlayerEngine engine, {SubtitleFilePicker? filePicker}) =>
+    (
+      audio: PlayerAudioTracksNav(
+        readTracks: () => engine.audioTracks,
+        tracksStream: engine.audioTracksStream,
+        onSelect: engine.selectAudioTrack,
+      ),
+      subtitle: PlayerSubtitleTracksNav(
+        readTracks: () => engine.subtitleTracks,
+        tracksStream: engine.subtitleTracksStream,
+        onSelect: engine.selectSubtitleTrack,
+        onDisable: engine.disableSubtitle,
+        readSession: () => engine.subtitleSession,
+        canScale: () => engine.canScaleSubtitle,
+        readScale: () => engine.subtitleScale,
+        onSetScale: engine.setSubtitleScale,
+        onLoadLocal: engine.loadLocalSubtitle,
+        filePicker: filePicker,
+      ),
+      video: PlayerVideoTracksNav(
+        tracks: engine.videoTracks,
+        tracksStream: engine.videoTracksStream,
+        onSelect: engine.selectVideoTrack,
+        isDisabled: engine.isVideoDisabled,
+      ),
+    );
+
+/// Windows 桌面端高清视频渲染与交互控制播放器组件
+class DesktopVideoPlayer extends StatefulWidget {
+  final MpvPlayerEngine playerEngine;
+  final DesktopWindowManager windowManager;
+
+  /// 画面缩放模式（`PlayerSettings.scale`）：决定视频纹理在窗口中的适配方式
+  final String scale;
+  final VoidCallback? onBack;
+
+  /// 可替换平台视频表面，控制栏与播放状态仍使用同一条真实渲染链路。
+  /// 未提供时使用 MPV 视频纹理。
+  final Widget? videoSurface;
+  final ValueListenable<EmbeddedPlaybackSession?>? embeddedPlayback;
+
+  /// 播放内切集视图模型；为空时不显示「上一集 / 下一集」（直播 / 推送 / 单集）。
+  final PlayerEpisodeNav? episodeNav;
+
+  /// 右侧「选集 + 线路」抽屉（§20）；为空时不显示入口（直播 / 推送 / 单集）。
+  final PlayerEpisodeListNav? episodeListNav;
+
+  /// 播放内刷新视图模型；为空时不显示「刷新」。
+  final PlayerRefreshNav? refreshNav;
+
+  /// 播放内片头 / 片尾视图模型；为空时不显示这两个入口（直播 / 推送 / 续播）。
+  final PlayerSkipNav? skipNav;
+
+  /// 播放内重播视图模型；为空时不显示「重播」。
+  final PlayerReplayNav? replayNav;
+
+  /// 当前播放引擎信息（如「MPV 播放器」）；为空时不显示。
+  final String? playerInfoLabel;
+
+  /// 画面比例选择回调（复用 `PlayerSettings.scaleOptions`）；为空时不显示比例入口。
+  final Future<void> Function(String scale)? onScaleChanged;
+
+  /// 视频轨视图模型；为空时不显示「视轨」。
+  final PlayerVideoTracksNav? videoTracksNav;
+
+  /// 音轨视图模型；为空时不显示「音轨」。
+  final PlayerAudioTracksNav? audioTracksNav;
+
+  /// 字幕视图模型；为空时不显示「字幕」。
+  final PlayerSubtitleTracksNav? subtitleTracksNav;
+
+  /// 重置视图模型；为空时不显示「重置」。
+  final PlayerResetNav? resetNav;
+
+  /// 线路视图模型；为空或只有一条线路时不显示「线路」分组。
+  final PlayerLineNav? lineNav;
+
+  final PlayerQualityNav? qualityNav;
+  final PlayerSourceSwitchNav? sourceSwitchNav;
+
+  /// 外部播放器入口；宿主取得播放地址并具备启动资格时提供。
+  final PlayerExternalNav? externalNav;
+
+  /// 兼容宿主传入的 seek 能力；恢复状态不参与提示或控制栏显隐。
+  final SeekRecoveryCapable? seekRecovery;
+
+  /// 直播页左上角「播放方式」胶囊；为空时不显示（点播 / 未进入直播）。
+  final PlaybackModeNav? playbackModeNav;
+
+  /// 频道抽屉头部的「直播源」下拉；为空时抽屉里不显示这一行。
+  final LiveSourceNav? liveSourceNav;
+
+  /// ⑤-3 直播切台快捷键（← / →）：仅直播时由宿主传入；为空时保持快退 / 快进。
+  final VoidCallback? onLivePrev;
+  final VoidCallback? onLiveNext;
+
+  /// ⑤-3 修复：直播频道抽屉数据。非空时在「视频表面层」挂
+  /// [LiveChannelLayer]（控制条之下）——返回 / 播放 / 时间轴不被遮挡。
+  final List<Live>? liveChannels;
+
+  /// 当前频道在 [liveChannels] 中的下标（抽屉高亮 / 滚动定位）。
+  final int liveCurrentIndex;
+
+  /// 已收藏频道的键集合（§34）：抽屉顶部置顶「收藏频道」小节用它过滤。
+  final Set<String> liveFavoriteKeys;
+
+  /// 抽屉选台回调；[liveChannels] 为空时不会触发。
+  final ValueChanged<int>? onLiveSelect;
+
+  /// 抽屉「管理频道」入口回调。
+  final VoidCallback? onLiveManage;
+
+  /// 播放页激活时是否隐藏窗口自绘标题栏（§38 沉浸播放）。
+  ///
+  /// 组件只把状态同步给窗口层（`DesktopWindowManager.setImmersive`），
+  /// 标题栏的浮出 / 收回由窗口框架负责；`false` 时回到传统布局。
+  final bool hideWindowTitleBar;
+
+  /// §51 底栏隐藏后是否显示贴底细进度线（设置中心「播放页」开关，实时生效）。
+  final bool showMiniProgress;
+
+  /// 在左上角显示当前视频宽高，独立于控制条显隐。默认关闭。
+  final bool showResolution;
+
+  /// 主快进键长按时的临时倍速（`PlayerSettings.holdRate`，实时生效）。
+  final double holdRate;
+
+  /// 长按临时加速开始时收到用户原倍速，结束时收到 null。
+  final ValueChanged<double?>? onHoldBaseRateChanged;
+
+  final PlayerShortcutBindings shortcuts;
+
+  /// §55 播放中鼠标静止 5 秒后隐藏光标（`PlayerSettings.autoHideCursor`，实时生效）。
+  final bool autoHideCursor;
+
+  /// 起播准备态（§16）：非空时在画面上盖一层骨架/失败面板。
+  ///
+  /// 解析播放地址在弱网下要几秒；把播放页先亮出来、状态放页内，
+  /// 用户点完立刻有反馈，且失败可原地重试。
+  final PlaybackIntent? preparing;
+
+  /// 准备失败时的「重试」回调。
+  final VoidCallback? onRetryPrepare;
+
+  /// 准备态的「返回」回调（退出准备态回到列表）。
+  final VoidCallback? onCancelPrepare;
+
+  /// 起播后检测到「正在播放但音量为 0」时回调一次（§36）。
+  ///
+  /// 用来提醒用户「不是没声音，是被静音了」。同一播放器实例只触发一次。
+  final VoidCallback? onMutedPlaybackDetected;
+
+  /// 用户把音量调到某个值（含静音 / 取消静音）后回调（§36）。
+  ///
+  /// 播放器只负责 UI 与 OSD；「记住这个音量」由宿主决定怎么落盘，
+  /// 这样窗口层不用认识 SettingsRepository。
+  final ValueChanged<double>? onVolumeCommitted;
+
+  /// 点播弹幕；实时弹幕来源存在时由 [liveDanmakuNav] 接管入口与绘制。
+  final PlayerDanmakuNav? danmakuNav;
+
+  /// 实时弹幕来源；不依赖媒体类型或点播弹幕服务配置。
+  final PlayerLiveDanmakuNav? liveDanmakuNav;
+
+  /// §44 共享片段；为空时不显示「片段」按钮与执行器（未配置服务 / 直播 / 推送）。
+  final PlayerSegmentsNav? segmentsNav;
+  const DesktopVideoPlayer({
+    super.key,
+    required this.playerEngine,
+    required this.windowManager,
+    this.hideWindowTitleBar = true,
+    this.showMiniProgress = true,
+    this.showResolution = false,
+    this.holdRate = PlayerSettings.defaultHoldRate,
+    this.onHoldBaseRateChanged,
+    this.shortcuts = PlayerShortcutBindings.defaults,
+    this.autoHideCursor = true,
+    this.scale = 'fit',
+    this.onBack,
+    this.videoSurface,
+    this.embeddedPlayback,
+    this.episodeNav,
+    this.episodeListNav,
+    this.refreshNav,
+    this.skipNav,
+    this.replayNav,
+    this.playerInfoLabel,
+    this.onScaleChanged,
+    this.videoTracksNav,
+    this.audioTracksNav,
+    this.subtitleTracksNav,
+    this.resetNav,
+    this.lineNav,
+    this.qualityNav,
+    this.sourceSwitchNav,
+    this.externalNav,
+    this.seekRecovery,
+    this.playbackModeNav,
+    this.liveSourceNav,
+    this.onLivePrev,
+    this.onLiveNext,
+    this.liveChannels,
+    this.liveCurrentIndex = 0,
+    this.liveFavoriteKeys = const {},
+    this.onLiveSelect,
+    this.onLiveManage,
+    this.preparing,
+    this.onRetryPrepare,
+    this.onCancelPrepare,
+    this.onVolumeCommitted,
+    this.onMutedPlaybackDetected,
+    this.danmakuNav,
+    this.liveDanmakuNav,
+    this.segmentsNav,
+  });
+
+  @override
+  State<DesktopVideoPlayer> createState() => _DesktopVideoPlayerState();
+}
+
+class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
+  final FocusNode _focusNode = FocusNode();
+  final OsdController _osdController = OsdController();
+
+  bool _showControls = true;
+  Timer? _hideControlsTimer;
+  static const Duration _hideDelay = Duration(seconds: 3);
+
+  /// §37：指针是否停在顶 / 底控制条热区内。
+  ///
+  /// 显隐判定从「鼠标在动」改成「指针在热区」—— 画面中部移动不再唤起控制条，
+  /// 离开热区 [_chromeExitDelay] 后收起（比 3 秒的键盘兜底快，才符合「移走就隐藏」）。
+  bool _pointerInChrome = false;
+
+  /// §44 指针停在右下角片段 / 跳过片头胶囊上（视作控制区：不隐藏控制条）
+  bool _pointerOnPill = false;
+  static const double _topChromeZone = 62;
+  static const double _bottomChromeZone = 110;
+  static const Duration _chromeExitDelay = Duration(milliseconds: 150);
+
+  /// §55 光标显隐独立于控制条：鼠标在播放器任意位置移动即显示，静止
+  /// [PlayerSettings.cursorIdleDelay] 后（且正在播放）隐藏。
+  ///
+  /// 以前光标跟着 `_showControls` 走，§37 之后画面中部移动不再唤起控制条，
+  /// 光标也就跟着「挪了也不出来」，只能把鼠标移出窗口。
+  bool _cursorAwake = true;
+  Timer? _cursorIdleTimer;
+
+  /// 沉浸播放（§38）：窗口自绘标题栏此时不渲染，窗口三键并进本顶栏。
+  bool _immersive = false;
+
+  /// §20 选集抽屉（右侧）：打开期间不自动隐藏控制条，Esc / 点遮罩关闭。
+  bool _episodeDrawerOpen = false;
+
+  /// 左上角「播放方式」菜单是否打开：打开期间顶栏常显、暂停自动隐藏。
+  bool _lineMenuOpen = false;
+  bool _qualityMenuOpen = false;
+  bool _speedMenuOpen = false;
+  int _liveChannelOpenRequest = 0;
+  bool _liveChannelDrawerOpen = false;
+  Timer? _channelWheelBurst;
+  bool _channelWheelUp = false;
+  VoidCallback? _refreshSettingsPanel;
+  bool _loadingLocalSubtitle = false;
+
+  bool get _drawerOrPanelOpen =>
+      _episodeDrawerOpen ||
+      _liveChannelDrawerOpen ||
+      _panelOpen ||
+      _lineMenuOpen ||
+      _qualityMenuOpen ||
+      _speedMenuOpen;
+
+  bool get _hasEditableFocus => playerShortcutHasEditableFocus();
+
+  String _shortcutLabel(PlayerShortcutAction action) => widget.shortcuts
+      .keysFor(action)
+      .map((binding) => binding.label)
+      .join(' / ');
+
+  /// 正在识别播放方式 / 按新方式重新起播：顶栏常显。
+  bool get _sourceBusy => widget.playbackModeNav?.busy == true;
+
+  final GlobalKey _bottomBarLayoutKey = GlobalKey();
+
+  // 换行后按实际高度保留热区；隐藏态仍参与布局，可从同一区域唤回。
+  double get _bottomChromeHeight {
+    final box = _bottomBarLayoutKey.currentContext?.findRenderObject();
+    return box is RenderBox && box.hasSize
+        ? box.size.height.clamp(_bottomChromeZone, double.infinity)
+        : _bottomChromeZone;
+  }
+
+  /// 底栏焦点跟踪：键盘焦点落在控制条内时暂停自动隐藏，
+  /// 避免焦点控件被滑出屏幕（WCAG 2.2 focus-not-obscured）。
+  final FocusNode _bottomBarFocusNode = FocusNode(
+      debugLabel: 'PlayerBottomBar',
+      skipTraversal: true,
+      canRequestFocus: false);
+  bool _bottomBarHasFocus = false;
+
+  double _dragSeekPositionMs = -1.0;
+  double _lastUnmutedVolume = 100.0;
+
+  /// 进度条悬停态（B5：悬停加粗，200ms 过渡）。
+  bool _progressHovered = false;
+
+  /// 视轨菜单最近一次成功选择（`auto` / `no` / `video:<id>`），用于关闭态勾选。
+  String? _videoSelectionOverride;
+
+  /// 静音提醒只弹一次（同一播放器实例内）。
+  bool _mutedHintSent = false;
+
+  /// 静音起播检测用的引擎状态订阅（dispose 时取消）。
+  StreamSubscription<PlaybackStatus>? _statusSubscription;
+
+  /// 主快进键临时倍速；进入长按前的倍速，松开 / 失焦时还原。
+  late final HoldToSpeedGesture _holdGesture = HoldToSpeedGesture(
+    getBinding: () => widget.shortcuts.primarySeekForward,
+    isEnabled: () => !_isLiveMode && !_usingEmbedded && !_drawerOrPanelOpen && !_hasEditableFocus,
+    onTap: () => _handleSeek(const Duration(seconds: 10)),
+    onHoldStart: _startHoldRate,
+    onHoldEnd: _endHoldRate,
+  );
+  double? _rateBeforeHold;
+  AppLifecycleListener? _lifecycleListener;
+
+  /// 当前会话是否为直播（派生自 `MediaPlaySpec.mode`）。
+  ///
+  /// 直播：不渲染进度条（[D4] 隐藏而不是只禁用）、时间标签改为「直播 · 已播」、
+  /// 常驻细进度线隐藏、所有 seek 入口兜底拒绝。点播保持现状。
+  bool get _isLiveMode => widget.playerEngine.currentSpec?.isLive == true;
+  bool get _usingEmbedded => widget.embeddedPlayback?.value != null;
+
+  bool get _isDraggingSeek => _dragSeekPositionMs >= 0;
+  bool get _hasPlaybackError => widget.playerEngine.status == PlaybackStatus.error;
+  bool get _canShowSourceActions =>
+      !_isLiveMode &&
+      widget.liveChannels == null &&
+      !widget.windowManager.isPipNotifier.value;
+  bool get _hasQualityChoices =>
+      !widget.windowManager.isPipNotifier.value &&
+      (widget.qualityNav?.names.length ?? 0) > 1;
+  bool get _canShowExternalPlayer =>
+      !_usingEmbedded &&
+      widget.externalNav != null &&
+      widget.preparing == null &&
+      !widget.windowManager.isPipNotifier.value &&
+      widget.playerEngine.currentSpec?.url.trim().isNotEmpty == true;
+
+  /// 活跃操作和播放错误期间，控制区必须保持可用。
+  bool get _chromeVisible =>
+      _showControls ||
+      widget.preparing != null ||
+      _lineMenuOpen ||
+      _qualityMenuOpen ||
+      _speedMenuOpen ||
+      _sourceBusy ||
+      _isDraggingSeek ||
+      _hasPlaybackError;
+
+  Future<void> _checkMutedPlayback() async {
+    if (_mutedHintSent) return;
+    final status = widget.playerEngine.status;
+    if (status != PlaybackStatus.playing) return;
+    if (widget.playerEngine.volume > 0) return;
+    _mutedHintSent = true;
+    widget.onMutedPlaybackDetected?.call();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.windowManager.isPipNotifier.addListener(_onPipChanged);
+    widget.windowManager.isImmersiveNotifier.addListener(_onImmersiveChanged);
+    _immersive = widget.windowManager.isImmersiveNotifier.value;
+    _syncImmersive(widget.hideWindowTitleBar);
+    _bottomBarFocusNode.addListener(_onBottomBarFocusChanged);
+    // 引擎是全应用单例（广播流）：订阅必须在 dispose 时取消，否则每进一次播放页
+    // 就多挂一个监听，闭包还会拽住整个 State 无法回收（2026-10-28 发布前资源审查）。
+    _statusSubscription = widget.playerEngine.statusStream.listen((status) {
+      if (!mounted) return;
+      if (status == PlaybackStatus.error) {
+        _hideControlsTimer?.cancel();
+        setState(() => _showControls = true);
+      } else {
+        // 错误退出后同步左缘热区资格，不能等下一次鼠标事件。
+        setState(() {});
+      }
+      if (status == PlaybackStatus.playing) {
+        _checkMutedPlayback();
+        // 暂停 / 缓冲期间光标不隐藏；恢复播放后重新计时。
+        if (_cursorAwake && _cursorIdleTimer?.isActive != true) {
+          _armCursorIdle();
+        }
+        // 自动收起只在「播放中」计时：起播缓冲、直播缓存回填都会让计时落空，
+        // 回到播放后补上，否则鼠标不动时工具栏永远常显。
+        if (_showControls && _hideControlsTimer?.isActive != true) {
+          _startHideTimer();
+        }
+      }
+    });
+    _startHideTimer();
+    _armCursorIdle();
+    // 窗口失焦时收不到 → 的松开事件：主动结束长按，倍速不会卡在临时值。
+    _focusNode.addListener(_onPlayerFocusChanged);
+    FocusManager.instance.addListener(_onPlayerFocusChanged);
+    _lifecycleListener = AppLifecycleListener(onInactive: _holdGesture.cancel);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
+  }
+
+  void _onPlayerFocusChanged() {
+    if (!_focusNode.hasFocus || _drawerOrPanelOpen || _hasEditableFocus) {
+      _holdGesture.cancel();
+    }
+  }
+
+  KeyEventResult _handlePlayerKeyEvent(KeyEvent event) {
+    if (_drawerOrPanelOpen || _hasEditableFocus) {
+      _holdGesture.cancel();
+      return KeyEventResult.ignored;
+    }
+    return _holdGesture.handleKeyEvent(event);
+  }
+
+  void _onLiveDrawerOpenChanged(bool open) {
+    if (!mounted || open == _liveChannelDrawerOpen) return;
+    if (open) _holdGesture.cancel();
+    setState(() => _liveChannelDrawerOpen = open);
+  }
+
+  void _startHoldRate() {
+    _rateBeforeHold = widget.playerEngine.rate;
+    widget.onHoldBaseRateChanged?.call(_rateBeforeHold);
+    final rate = widget.holdRate;
+    widget.playerEngine.setRate(rate);
+    _osdController.show(Icons.fast_forward_rounded, '${_rateLabel(rate)}x ▶▶',
+        persistent: true);
+  }
+
+  void _endHoldRate() {
+    final restore = _rateBeforeHold;
+    _rateBeforeHold = null;
+    if (restore == null) return;
+    widget.onHoldBaseRateChanged?.call(null);
+    widget.playerEngine.setRate(restore);
+    if (mounted) _osdController.dismiss();
+  }
+
+  static String _rateLabel(double rate) =>
+      rate == rate.roundToDouble() ? rate.toInt().toString() : rate.toString();
+
+  @override
+  void didUpdateWidget(covariant DesktopVideoPlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.shortcuts != widget.shortcuts) _holdGesture.cancel();
+    if (widget.episodeNav?.switching == true &&
+        oldWidget.episodeNav?.switching != true) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _holdGesture.cancel();
+      });
+    }
+    if (widget.liveChannels?.isNotEmpty != true) _liveChannelDrawerOpen = false;
+    if (oldWidget.qualityNav != widget.qualityNav ||
+        oldWidget.sourceSwitchNav != widget.sourceSwitchNav) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _refreshSettingsPanel?.call();
+      });
+    }
+    if (oldWidget.videoTracksNav != widget.videoTracksNav) {
+      _videoSelectionOverride = null;
+    }
+    if (oldWidget.hideWindowTitleBar != widget.hideWindowTitleBar) {
+      _syncImmersive(widget.hideWindowTitleBar);
+    }
+    // 会话关闭 / 切成直播：抽屉没有内容可列，直接收起（避免空面板挂屏）。
+    if (widget.episodeListNav == null && _episodeDrawerOpen) {
+      _episodeDrawerOpen = false;
+    }
+    final wasBusy = oldWidget.playbackModeNav?.busy ?? false;
+    if (wasBusy != _sourceBusy) {
+      if (_sourceBusy) {
+        _hideControlsTimer?.cancel();
+        _showControls = true;
+      } else {
+        _startHideTimer();
+      }
+    }
+    if (widget.playbackModeNav == null && _lineMenuOpen) {
+      _lineMenuOpen = false;
+    }
+  }
+
+  /// 「播放方式」菜单开合：打开时顶栏常显并暂停自动隐藏；关闭后恢复计时。
+  void _handleSourceMenuOpen(bool open) {
+    if (_lineMenuOpen == open) return;
+    if (open) _holdGesture.cancel();
+    setState(() => _lineMenuOpen = open);
+    if (open) {
+      _hideControlsTimer?.cancel();
+      if (!_showControls) setState(() => _showControls = true);
+    } else if (mounted) {
+      _startHideTimer();
+    }
+  }
+
+  @override
+  void dispose() {
+    _holdGesture.dispose();
+    _lifecycleListener?.dispose();
+    _focusNode.removeListener(_onPlayerFocusChanged);
+    FocusManager.instance.removeListener(_onPlayerFocusChanged);
+    unawaited(_statusSubscription?.cancel());
+    _hideControlsTimer?.cancel();
+    _cursorIdleTimer?.cancel();
+    _channelWheelBurst?.cancel();
+    _syncImmersive(false);
+    widget.windowManager.isPipNotifier.removeListener(_onPipChanged);
+    widget.windowManager.isImmersiveNotifier
+        .removeListener(_onImmersiveChanged);
+    _bottomBarFocusNode.removeListener(_onBottomBarFocusChanged);
+    _bottomBarFocusNode.dispose();
+    _focusNode.dispose();
+    _osdController.dispose();
+    super.dispose();
+  }
+
+  void _onUserActivity() {
+    // 从设置中心等覆盖层返回后焦点不会自动回到播放器，用户一有操作即收回快捷键焦点
+    if (!_focusNode.hasFocus) _focusNode.requestFocus();
+    if (!_showControls) {
+      setState(() => _showControls = true);
+    }
+    _startHideTimer();
+  }
+
+  void _startHideTimer() => _scheduleHide(_hideDelay);
+
+  void _scheduleHide(Duration delay) {
+    _hideControlsTimer?.cancel();
+    // 焦点在控制条内时不自动隐藏（WCAG 2.2 focus-not-obscured）；
+    // §37：指针停在热区里时也不隐藏（「放上去就显示」）。
+    if (_bottomBarHasFocus ||
+        _episodeDrawerOpen ||
+        _pointerInChrome ||
+        _lineMenuOpen ||
+        _qualityMenuOpen ||
+        _speedMenuOpen ||
+        _panelOpen ||
+        _isDraggingSeek ||
+        _sourceBusy) {
+      return;
+    }
+    if (widget.playerEngine.status == PlaybackStatus.playing) {
+      _hideControlsTimer = Timer(delay, () {
+        if (mounted &&
+            widget.playerEngine.status == PlaybackStatus.playing &&
+            !_pointerInChrome &&
+            !_isDraggingSeek &&
+            !_qualityMenuOpen &&
+            !_speedMenuOpen &&
+            !_panelOpen) {
+          setState(() => _showControls = false);
+        }
+      });
+    }
+  }
+
+  void _previewSeek(double value) {
+    _hideControlsTimer?.cancel();
+    setState(() {
+      _dragSeekPositionMs = value;
+      _showControls = true;
+    });
+  }
+
+  void _commitSeek(double value) {
+    if (!_isLiveMode) {
+      unawaited(widget.playerEngine.seek(Duration(milliseconds: value.toInt())));
+    }
+    setState(() => _dragSeekPositionMs = -1.0);
+    _startHideTimer();
+  }
+
+  /// §55 鼠标移动：光标立即显示并重新开始静止计时。
+  void _onPointerMoved() {
+    if (!_cursorAwake) setState(() => _cursorAwake = true);
+    _armCursorIdle();
+  }
+
+  void _armCursorIdle() {
+    _cursorIdleTimer?.cancel();
+    _cursorIdleTimer = Timer(PlayerSettings.cursorIdleDelay, () {
+      if (!mounted || !widget.autoHideCursor) return;
+      // 暂停 / 缓冲 / 出错时保持可见（要点按钮）；恢复播放时由状态监听重新计时。
+      if (widget.playerEngine.status != PlaybackStatus.playing) return;
+      if (_cursorAwake) setState(() => _cursorAwake = false);
+    });
+  }
+
+  /// 光标是否可见：关闭自动隐藏、最近动过、或控制条正显示（指针可能停在按钮上）。
+  bool get _cursorVisible =>
+      !widget.autoHideCursor || _cursorAwake || _chromeVisible;
+
+  /// §37：指针位置决定显隐 —— 只认顶 / 底热区，画面中部移动不再唤起。
+  void _onChromeHover(Offset localPosition) {
+    _onPointerMoved();
+    // PiP 小窗保留旧口径：窗口只有 400×225，热区化会让整窗都是热区。
+    if (widget.windowManager.isPipNotifier.value) {
+      _onUserActivity();
+      return;
+    }
+    final size = context.size;
+    if (size == null) return;
+    final inZone = _pointerOnPill ||
+        localPosition.dy <= _topChromeZone ||
+        localPosition.dy >= size.height - _bottomChromeHeight;
+    if (inZone) {
+      _pointerInChrome = true;
+      _hideControlsTimer?.cancel();
+      if (!_showControls) setState(() => _showControls = true);
+      return;
+    }
+    _pointerInChrome = false;
+    // 已经排期过就不再反复重置（悬停事件非常密集）。
+    if (_showControls && _hideControlsTimer?.isActive != true) {
+      _scheduleHide(_chromeExitDelay);
+    }
+  }
+
+  /// 指针离开播放器（例如移到窗口标题栏）时按「移走就隐藏」处理。
+  void _onChromeExit() {
+    if (widget.windowManager.isPipNotifier.value) return;
+    _pointerInChrome = false;
+    if (_showControls) _scheduleHide(_chromeExitDelay);
+  }
+
+  /// 把「沉浸播放」开关同步给窗口层。
+  ///
+  /// 必须挪出 build 相位：窗口框架用 `ValueListenableBuilder` 监听它，
+  /// 在 initState / didUpdateWidget 里直接改通知器会触发
+  /// 「setState() called during build」。微任务在当帧回调结束后执行，既安全又不闪。
+  void _syncImmersive(bool value) {
+    final manager = widget.windowManager;
+    scheduleMicrotask(() {
+      if (value && !mounted) return;
+      manager.setImmersive(value);
+    });
+  }
+
+  void _onImmersiveChanged() {
+    final immersive = widget.windowManager.isImmersiveNotifier.value;
+    if (immersive == _immersive) return;
+    if (mounted) setState(() => _immersive = immersive);
+  }
+
+  void _onBottomBarFocusChanged() {
+    final hasFocus = _bottomBarFocusNode.hasFocus;
+    if (hasFocus == _bottomBarHasFocus) return;
+    _hideControlsTimer?.cancel();
+    setState(() {
+      _bottomBarHasFocus = hasFocus;
+      // 焦点进入时确保控制条可见（含 Tab 进入已隐藏控制条的场景）；
+      // 焦点离开后由 _startHideTimer 恢复倒计时。
+      if (hasFocus) _showControls = true;
+    });
+    if (!hasFocus) _startHideTimer();
+  }
+
+  /// §20：工具栏按钮开关右侧选集抽屉。
+  void _toggleEpisodeDrawer() {
+    if (widget.episodeListNav == null) return;
+    if (_episodeDrawerOpen) {
+      _closeEpisodeDrawer();
+      return;
+    }
+    _holdGesture.cancel();
+    _hideControlsTimer?.cancel();
+    setState(() {
+      _showControls = true;
+      _episodeDrawerOpen = true;
+    });
+  }
+
+  void _closeEpisodeDrawer() {
+    if (!_episodeDrawerOpen) return;
+    setState(() => _episodeDrawerOpen = false);
+    _startHideTimer();
+  }
+
+  /// 画面单击：控制条收起时第一次单击只呼出控制条（issue #10-⑤），
+  /// 已展开时才切换播放 / 暂停；键盘 / 控制条按钮仍直接切换。
+  void _handleSurfaceTap() {
+    if (!_showControls) {
+      _onUserActivity();
+      return;
+    }
+    _togglePlayPause();
+  }
+
+  void _togglePlayPause() {
+    final isPlaying = widget.playerEngine.status == PlaybackStatus.playing;
+    if (isPlaying) {
+      widget.playerEngine.pause();
+      _osdController.show(Icons.pause_rounded, '已暂停');
+    } else {
+      widget.playerEngine.resume();
+      _osdController.show(Icons.play_arrow_rounded, '播放中');
+    }
+    _onUserActivity();
+  }
+
+  void _handleSeek(Duration delta) {
+    // 直播没有可 seek 的时间轴：UI 层先兜底拒绝（引擎侧还有一层，
+    // 防止画中画 / 脚本等将来新增的入口把直播推进「seek → 流错误 → 重连」）。
+    if (_isLiveMode) {
+      _osdController.show(Icons.live_tv_rounded, '直播不支持拖动');
+      _onUserActivity();
+      return;
+    }
+    final curPos = widget.playerEngine.position;
+    final dur = widget.playerEngine.duration;
+    final targetMs = (curPos.inMilliseconds + delta.inMilliseconds)
+        .clamp(0, dur.inMilliseconds);
+    final targetDuration = Duration(milliseconds: targetMs);
+    widget.playerEngine.seek(targetDuration);
+
+    final isForward = delta > Duration.zero;
+    _osdController.show(
+      isForward ? Icons.fast_forward_rounded : Icons.fast_rewind_rounded,
+      '${isForward ? '+' : ''}${delta.inSeconds}s',
+      subText: '${_formatDuration(targetDuration)} / ${_formatDuration(dur)}',
+    );
+    _onUserActivity();
+  }
+
+  void _handleVolumeAdjust(double delta) {
+    final currentVol = widget.playerEngine.volume;
+    final targetVol = (currentVol + delta).clamp(0.0, 100.0);
+    widget.playerEngine.setVolume(targetVol);
+    if (targetVol > 0) _lastUnmutedVolume = targetVol;
+
+    _osdController.show(
+      targetVol == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+      '音量: ${targetVol.toInt()}%',
+    );
+    _commitVolume(targetVol);
+    _onUserActivity();
+  }
+
+  /// 把最新音量交给宿主记住（§36）。静音时上报 0 —— 宿主会跳过 0，
+  /// 避免「静音一次，下次进来默认音量也变成 0」。
+  void _commitVolume(double value) {
+    widget.onVolumeCommitted?.call(value);
+  }
+
+  void _handleToggleMute() {
+    final currentVol = widget.playerEngine.volume;
+    if (currentVol > 0) {
+      _lastUnmutedVolume = currentVol;
+      widget.playerEngine.setVolume(0.0);
+      _osdController.show(Icons.volume_off_rounded, '已静音');
+      _commitVolume(0);
+    } else {
+      final restoreVol = _lastUnmutedVolume > 0 ? _lastUnmutedVolume : 100.0;
+      widget.playerEngine.setVolume(restoreVol);
+      _osdController.show(
+          Icons.volume_up_rounded, '音量: ${restoreVol.toInt()}%');
+      _commitVolume(restoreVol);
+    }
+    _onUserActivity();
+  }
+
+  void _handleRateAdjust(double delta, {bool reset = false}) {
+    if (_isLiveMode || _usingEmbedded) return;
+    _holdGesture.cancel();
+    final currentRate = widget.playerEngine.rate;
+    final targetRate = reset ? 1.0 : (currentRate + delta).clamp(0.25, 3.0);
+    widget.playerEngine.setRate(targetRate);
+
+    _osdController.show(Icons.speed_rounded, '倍速: ${targetRate}x');
+    _onUserActivity();
+  }
+
+  void _handlePrevEpisode() {
+    final nav = widget.episodeNav;
+    if (nav == null || nav.switching || !nav.canPrev) return;
+    _holdGesture.cancel();
+    _osdController.show(Icons.skip_previous_rounded, '上一集');
+    nav.onPrevEpisode();
+    _onUserActivity();
+  }
+
+  void _handleNextEpisode() {
+    final nav = widget.episodeNav;
+    if (nav == null || nav.switching || !nav.canNext) return;
+    _holdGesture.cancel();
+    _osdController.show(Icons.skip_next_rounded, '下一集');
+    nav.onNextEpisode();
+    _onUserActivity();
+  }
+
+  void _handleRefresh() {
+    final nav = widget.refreshNav;
+    if (nav == null || nav.busy) return;
+    _osdController.show(Icons.refresh_rounded, '刷新中…');
+    nav.onRefresh();
+    _onUserActivity();
+  }
+
+  void _handleOpeningSkip() {
+    final nav = widget.skipNav;
+    if (nav == null) return;
+    nav.onSetOpeningAt(widget.playerEngine.position.inMilliseconds);
+    _onUserActivity();
+  }
+
+  void _handleEndingSkip() {
+    final nav = widget.skipNav;
+    if (nav == null) return;
+    nav.onSetEndingAt(widget.playerEngine.position.inMilliseconds);
+    _onUserActivity();
+  }
+
+  void _handleClearOpeningSkip() {
+    final nav = widget.skipNav;
+    if (nav == null) return;
+    nav.onClearOpening();
+    _onUserActivity();
+  }
+
+  void _handleClearEndingSkip() {
+    final nav = widget.skipNav;
+    if (nav == null) return;
+    nav.onClearEnding();
+    _onUserActivity();
+  }
+
+  void _handleSurfacePointerSignal(PointerSignalEvent event, Size size) {
+    if (event is! PointerScrollEvent || event.scrollDelta.dy == 0) return;
+    final position = event.localPosition;
+    final mid = size.width / 2;
+    final up = event.scrollDelta.dy < 0;
+    final channelZone = (widget.liveChannels?.length ?? 0) > 1 &&
+        !widget.windowManager.isPipNotifier.value &&
+        position.dx >= size.width / 4 && position.dx <= mid;
+    if (!channelZone) {
+      if (position.dx >= mid) _handleVolumeAdjust(up ? 5.0 : -5.0);
+      return;
+    }
+    if (event.kind != PointerDeviceKind.mouse ||
+        event.scrollDelta.dy.abs() <= event.scrollDelta.dx.abs() ||
+        position.dy <= _topChromeZone ||
+        position.dy >= size.height - _bottomChromeHeight ||
+        _drawerOrPanelOpen || _sourceBusy || widget.preparing != null) {
+      return;
+    }
+    final step = up ? widget.onLivePrev : widget.onLiveNext;
+    if (step == null) return;
+    // 飞轮的连续同向事件只开一次流；反向或停滚后可立即选另一台。
+    final repeated = _channelWheelBurst != null && _channelWheelUp == up;
+    _channelWheelBurst?.cancel();
+    _channelWheelUp = up;
+    _channelWheelBurst = Timer(const Duration(milliseconds: 220),
+        () => _channelWheelBurst = null);
+    if (!repeated) step();
+  }
+
+  /// 时间轴右键菜单：在点击处设置片头 / 片尾，或清除已设标记。
+  Future<void> _showTimelineMenu(TapUpDetails details, double width) async {
+    final nav = widget.skipNav;
+    if (nav == null) return;
+    final durMs = widget.playerEngine.duration.inMilliseconds;
+    final blocked = durMs <= 0;
+    // 滑条两端让出 overlay 半径（24px）后线性映射；中点 ≈ 时长一半。
+    const inset = 24.0;
+    final track = (width - inset * 2).clamp(1.0, double.infinity);
+    final fraction =
+        ((details.localPosition.dx - inset) / track).clamp(0.0, 1.0);
+    final clickedMs = (fraction * durMs).round();
+    final at = _formatDuration(Duration(milliseconds: clickedMs));
+    final choice = await showMenu<int>(
+      context: context,
+      color: context.palette.raised,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadii.md)),
+      position: RelativeRect.fromLTRB(
+        details.globalPosition.dx,
+        details.globalPosition.dy,
+        details.globalPosition.dx,
+        details.globalPosition.dy,
+      ),
+      items: [
+        PopupMenuItem<int>(
+          value: 0,
+          enabled: !blocked,
+          height: 40,
+          child: _menuIconRow(Icons.skip_next_rounded, '设为片头（$at）'),
+        ),
+        PopupMenuItem<int>(
+          value: 1,
+          enabled: !blocked,
+          height: 40,
+          child: _menuIconRow(Icons.skip_previous_rounded, '设为片尾（$at）'),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem<int>(
+          value: 2,
+          enabled: nav.openingMs > 0,
+          height: 40,
+          child: _menuIconRow(Icons.close_rounded, '清除片头'),
+        ),
+        PopupMenuItem<int>(
+          value: 3,
+          enabled: nav.endingMs > 0,
+          height: 40,
+          child: _menuIconRow(Icons.close_rounded, '清除片尾'),
+        ),
+      ],
+    );
+    if (!mounted || choice == null) return;
+    _onUserActivity();
+    if (choice == 0) {
+      if (!blocked) nav.onSetOpeningAt(clickedMs);
+    } else if (choice == 1) {
+      if (!blocked) nav.onSetEndingAt(clickedMs);
+    } else if (choice == 2) {
+      nav.onClearOpening();
+    } else if (choice == 3) {
+      nav.onClearEnding();
+    }
+  }
+
+  /// 重播：回到起点后继续播放（不重新解析、不重建播放器）。
+  void _handleReplay() {
+    final nav = widget.replayNav;
+    if (nav == null || nav.busy) return;
+    nav.onReplay();
+    _osdController.show(Icons.replay_rounded, '从头重播');
+    _onUserActivity();
+  }
+
+  void _handleExit() {
+    // §39：准备态（解析中 / 失败）优先取消，Esc 与返回键随时可用。
+    if (widget.preparing != null) {
+      final cancel = widget.onCancelPrepare;
+      if (cancel != null) {
+        _osdController.show(Icons.close_rounded, '已取消播放准备');
+        cancel();
+        return;
+      }
+    }
+    // §20：抽屉打开时 Esc 先收抽屉，不退出全屏 / 不返回主视图。
+    if (_episodeDrawerOpen) {
+      _closeEpisodeDrawer();
+      return;
+    }
+    // 画中画优先还原：Esc 是小窗的标准退出路径（skill `escape-routes`）。
+    if (widget.windowManager.isPipNotifier.value) {
+      unawaited(widget.windowManager.exitPip());
+      _osdController.show(Icons.open_in_full_rounded, '已还原窗口');
+      return;
+    }
+    if (widget.windowManager.isFullScreenNotifier.value) {
+      widget.windowManager.toggleFullScreen();
+      _osdController.show(Icons.fullscreen_exit_rounded, '退出全屏');
+    } else if (widget.onBack != null) {
+      widget.onBack!();
+    }
+  }
+
+  /// 画面双击：正常态 = 全屏（既有语义）；PiP 内 = 先还原再全屏，保持
+  /// 「双击进全屏」的直觉且状态干净。
+  void _handleSurfaceDoubleTap() {
+    final manager = widget.windowManager;
+    if (manager.isPipNotifier.value) {
+      unawaited(manager.exitPip().then((_) => manager.toggleFullScreen()));
+      return;
+    }
+    manager.toggleFullScreen();
+  }
+
+  /// PiP 状态变化 → 重建（顶栏隐藏 / 底栏切换精简版）。
+  void _onPipChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// 频道抽屉置于控制栏之上；错误时热区避开工具栏，仍可选择其他频道。
+  Widget _wrapLiveLayer(Widget player) {
+    final channels = widget.liveChannels;
+    if (channels == null || channels.isEmpty) return player;
+    return LiveChannelLayer(
+      channels: channels,
+      currentIndex: widget.liveCurrentIndex,
+      enabled: !widget.windowManager.isPipNotifier.value && !_lineMenuOpen,
+      canOpen: !_chromeVisible || _hasPlaybackError,
+      // 滑出动画结束前底栏仍可点击；热区始终避开控制条唤回区域。
+      hotzoneInsets: EdgeInsets.only(top: 54, bottom: _bottomChromeHeight),
+      openRequest: _liveChannelOpenRequest,
+      onOpenChanged: _onLiveDrawerOpenChanged,
+      initiallyOpen: true,
+      favoriteKeys: widget.liveFavoriteKeys,
+      onSelect: widget.onLiveSelect ?? (_) {},
+      onManage: widget.onLiveManage ?? () {},
+      sourceNav: widget.liveSourceNav,
+      child: player,
+    );
+  }
+
+  void _openLiveChannelDrawer() {
+    if (widget.liveChannels?.isNotEmpty != true ||
+        widget.windowManager.isPipNotifier.value) {
+      return;
+    }
+    setState(() {
+      _liveChannelOpenRequest++;
+      _lineMenuOpen = false;
+    });
+  }
+
+  /// §20 选集抽屉同样挂在「视频表面层」：控制条在它之上，
+  /// 工具栏按钮可在抽屉打开时再点一次收起，Esc / 点遮罩也能关。
+  Widget _wrapEpisodeLayer(Widget surface) {
+    final nav = widget.episodeListNav;
+    if (nav == null) return surface;
+    return EpisodeDrawerLayer(
+      open: _episodeDrawerOpen,
+      nav: nav,
+      onClose: _closeEpisodeDrawer,
+      child: surface,
+    );
+  }
+
+  Widget _buildPlaybackStatus({required bool pip}) {
+    final engine = widget.playerEngine;
+    return Center(
+      child: StreamBuilder<PlaybackStatus>(
+        stream: engine.statusStream,
+        initialData: engine.status,
+        builder: (context, snapshot) {
+          if (snapshot.data == PlaybackStatus.buffering) {
+            return CircularProgressIndicator(
+              color: context.palette.accentInk,
+              strokeWidth: 3.5,
+            );
+          }
+          if (snapshot.data != PlaybackStatus.error) {
+            return const SizedBox.shrink();
+          }
+          return PlaybackErrorPanel(
+            rawError: engine.currentError,
+            spec: engine.currentSpec,
+            engineLogs: engine.recentPlayerLogs,
+            externalNav: _canShowExternalPlayer ? widget.externalNav : null,
+            sourceSwitchNav: _canShowSourceActions ? widget.sourceSwitchNav : null,
+            onOpenEpisodeList: _canShowSourceActions &&
+                    widget.episodeListNav?.switching == false
+                ? _toggleEpisodeDrawer
+                : null,
+            onOpenChannelList: !pip && widget.liveChannels?.isNotEmpty == true
+                ? _openLiveChannelDrawer
+                : null,
+          );
+        },
+      ),
+    );
+  }
+
+  String _formatDuration(Duration d) {
+    final hours = d.inHours;
+    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+  }
+
+  Widget _buildResolutionBadge() {
+    return StreamBuilder<VideoDimensions>(
+      stream: widget.playerEngine.dimensionsStream,
+      initialData: widget.playerEngine.dimensions,
+      builder: (context, snapshot) {
+        final dimensions = snapshot.data;
+        if (dimensions == null || dimensions.width <= 0 || dimensions.height <= 0) {
+          return const SizedBox.shrink();
+        }
+        return Semantics(
+          label: '视频分辨率 ${dimensions.width} × ${dimensions.height}',
+          excludeSemantics: true,
+          child: Container(
+            key: const ValueKey('player-resolution'),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.6),
+              borderRadius: BorderRadius.circular(AppRadii.xs),
+            ),
+            child: Text(
+              '${dimensions.width} × ${dimensions.height}',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: AppType.caption,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sessions = widget.embeddedPlayback;
+    if (sessions == null) return _buildPlayer(null);
+    return ValueListenableBuilder<EmbeddedPlaybackSession?>(
+      valueListenable: sessions,
+      builder: (_, session, _) => _buildPlayer(session),
+    );
+  }
+
+  Widget _buildPlayer(EmbeddedPlaybackSession? session) {
+    final pip = widget.windowManager.isPipNotifier.value;
+    final canCancelPrepare =
+        widget.preparing != null && widget.onCancelPrepare != null;
+    return PlayerShortcutScope(
+      bindings: widget.shortcuts,
+      enabled: !_drawerOrPanelOpen,
+      child: Actions(
+        actions: {
+          PlayPauseIntent: CallbackAction<PlayPauseIntent>(
+              onInvoke: (_) => _togglePlayPause()),
+          SeekIntent: CallbackAction<SeekIntent>(
+            onInvoke: (i) {
+              // ⑤-3 直播：←/→ 切台（点播仍为快退 / 快进）
+              if (widget.playerEngine.currentSpec?.isLive == true) {
+                final callback =
+                    i.delta.isNegative ? widget.onLivePrev : widget.onLiveNext;
+                if (callback != null) {
+                  callback();
+                  return null;
+                }
+              }
+              _handleSeek(i.delta);
+              return null;
+            },
+          ),
+          VolumeIntent: CallbackAction<VolumeIntent>(
+              onInvoke: (i) => _handleVolumeAdjust(i.delta)),
+          ToggleMuteIntent: CallbackAction<ToggleMuteIntent>(
+              onInvoke: (_) => _handleToggleMute()),
+          ToggleFullscreenIntent: CallbackAction<ToggleFullscreenIntent>(
+            onInvoke: (_) {
+              final manager = widget.windowManager;
+              if (manager.isPipNotifier.value) {
+                // 小窗内 F / F11：先还原再全屏，避免「小窗全屏」怪状态。
+                unawaited(
+                    manager.exitPip().then((_) => manager.toggleFullScreen()));
+                _osdController.show(Icons.fullscreen_rounded, '还原并全屏');
+                return null;
+              }
+              manager.toggleFullScreen();
+              _osdController.show(Icons.fullscreen_rounded, '切换全屏');
+              return null;
+            },
+          ),
+          ExitFullscreenIntent: CallbackAction<ExitFullscreenIntent>(
+              onInvoke: (_) => _handleExit()),
+          RateAdjustIntent: CallbackAction<RateAdjustIntent>(
+            onInvoke: (i) => _handleRateAdjust(i.delta, reset: i.reset),
+          ),
+          PrevEpisodeIntent: CallbackAction<PrevEpisodeIntent>(
+              onInvoke: (_) => _handlePrevEpisode()),
+          NextEpisodeIntent: CallbackAction<NextEpisodeIntent>(
+              onInvoke: (_) => _handleNextEpisode()),
+          ToggleDanmakuIntent: CallbackAction<ToggleDanmakuIntent>(
+              onInvoke: (_) => _handleToggleDanmaku()),
+        },
+        child: Focus(
+          focusNode: _focusNode,
+          autofocus: true,
+          onKeyEvent: (_, event) => _handlePlayerKeyEvent(event),
+          child: MouseRegion(
+            // §37：显隐判定改为「指针在不在顶/底热区」，不再按活动续命。
+            onHover: (event) => _onChromeHover(event.localPosition),
+            onExit: (_) => _onChromeExit(),
+            cursor: _cursorVisible
+                ? SystemMouseCursors.basic
+                : SystemMouseCursors.none,
+            // 直播频道抽屉包住整层，画在顶栏 / 时间轴工具栏之上（见 _wrapLiveLayer）。
+            child: _wrapLiveLayer(Stack(
+              children: [
+                // 1. MPV 原生 Direct3D 11 视频渲染表面
+                //    双击切全屏只挂在这一层：控制条不参与双击判定，连点按钮不会误切全屏。
+                Positioned.fill(
+                  // §43 层级（2026-10-27 验收反馈）：弹幕在视频之上、选集抽屉之下——
+                  // 抽屉打开时盖住弹幕，而不是弹幕从抽屉上飘过去。
+                  child: _wrapEpisodeLayer(Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      LayoutBuilder(
+                        builder: (context, constraints) => Listener(
+                          onPointerSignal: (event) => _handleSurfacePointerSignal(
+                              event, constraints.biggest),
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _handleSurfaceTap,
+                            // PiP：按住画面拖动小窗（原生拖拽）；拖拽与点击由手势
+                            // 竞技场区分，不影响单击播放/暂停。
+                            onPanStart: pip
+                                ? (_) => unawaited(
+                                    widget.windowManager.startDragging())
+                                : null,
+                            onDoubleTap: _handleSurfaceDoubleTap,
+                            child: session != null
+                                ? _embeddedVideo(session)
+                                : widget.videoSurface ?? Video(
+                                    controller: widget.playerEngine.videoController,
+                                    controls: NoVideoControls,
+                                    fit: videoFitForScale(widget.scale),
+                                  ),
+                          ),
+                        ),
+                      ),
+                      if (widget.showResolution && widget.preparing == null)
+                        Positioned(
+                          left: 16,
+                          top: _chromeVisible && !pip ? 62 : 12,
+                          child: IgnorePointer(child: _buildResolutionBadge()),
+                        ),
+                      // 弹幕和错误提示都在抽屉之下，不能拦截遮罩上的点击。
+                      if (_hasDanmaku)
+                        Positioned.fill(child: _buildDanmakuLayer(pip: pip)),
+                      _buildPlaybackStatus(pip: pip),
+                    ],
+                  )),
+                ),
+
+                // 3. 屏幕实时交互浮层提示 (OSD)
+                Positioned.fill(
+                  child: PlayerOsdOverlay(controller: _osdController),
+                ),
+
+                // 4. 顶部半透明渐变控制条
+                // §39：准备态期间顶栏常驻（否则返回按钮会随自动隐藏一起消失，
+                // 而整屏准备浮层又挡住返回，用户就彻底没有出口了）。
+                AnimatedPositioned(
+                  duration: _chromeMotion(context, visible: _chromeVisible),
+                  top: _chromeVisible && !pip ? 0 : -60,
+                  height: MediaTitleBar.height,
+                  left: 0,
+                  right: 0,
+                  child: Overlay.wrap(
+                    clipBehavior: Clip.none,
+                    child: MediaTitleBar(
+                      key: const ValueKey('player-top-bar'),
+                      scope: 'player',
+                      title: widget.playerEngine.currentSpec?.title ?? '',
+                      windowManager: _immersive ? widget.windowManager : null,
+                      backKey: canCancelPrepare
+                          ? const ValueKey('player-back-cancel') : null,
+                      backTooltip: '${canCancelPrepare ? '取消并返回' : '返回'} (${_shortcutLabel(PlayerShortcutAction.exitFullscreen)})',
+                      onBack: canCancelPrepare
+                          ? widget.onCancelPrepare : widget.onBack,
+                      leadingAccessory: widget.playbackModeNav == null
+                          ? null
+                          : PlaybackModeBadge(
+                              nav: widget.playbackModeNav!,
+                              onMenuOpenChanged: _handleSourceMenuOpen,
+                            ),
+                      actions: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: _chromeBadge.withValues(alpha: 0.8),
+                            borderRadius: BorderRadius.circular(AppRadii.xs),
+                          ),
+                          child: const Text(
+                            'HW: D3D11',
+                            style: TextStyle(
+                              color: _chromeInk,
+                              fontSize: AppType.caption,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                // 5. 底栏隐藏时的常驻细进度线（贴窗口底、不可点击；无时长时不可见）
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: _buildMiniProgressLine(context),
+                ),
+
+                // 6. 底部播放控制面板
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: AnimatedSlide(
+                    duration: _chromeMotion(context, visible: _chromeVisible),
+                    // 按自身高度完整出屏，兼容按钮换行和文字缩放。
+                    offset: _chromeVisible ? Offset.zero : const Offset(0, 1),
+                    child: Focus(
+                      key: _bottomBarLayoutKey,
+                      focusNode: _bottomBarFocusNode,
+                      // 纯焦点信号监听，不进语义树（避免改变逐帧语义增量）。
+                      includeSemantics: false,
+                      child: pip
+                          ? _buildPipCompactBar()
+                          : Container(
+                              key: const ValueKey('player-bottom-bar'),
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 16, vertical: 8),
+                              decoration: const BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.bottomCenter,
+                                  end: Alignment.topCenter,
+                                  colors: [_chromeScrim, _chromeScrimFade],
+                                ),
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  // 进度条行：进度条 + 时间（时间固定在右端）
+                                  Row(
+                                    children: [
+                                      // 本地 Overlay：滑条语义节点随底栏整体出屏 / 恢复。
+                                      Expanded(
+                                        child: LayoutBuilder(
+                                          builder: (context, constraints) =>
+                                              GestureDetector(
+                                            // 时间轴右键：在点击处设置片头 / 片尾，或清除。
+                                            onSecondaryTapUp: (details) =>
+                                                _showTimelineMenu(details,
+                                                    constraints.maxWidth),
+                                            child: Overlay.wrap(
+                                              alwaysSizeToContent: true,
+                                              clipBehavior: Clip.none,
+                                              child: _buildProgressBar(),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      _buildTimeLabel(),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 2),
+                                  // 空间不足时右侧组换行，所有按钮仍可直接点击。
+                                  Overlay.wrap(
+                                    alwaysSizeToContent: true,
+                                    clipBehavior: Clip.none,
+                                    child: OverflowBar(
+                                      alignment: MainAxisAlignment.spaceBetween,
+                                      overflowAlignment: OverflowBarAlignment.end,
+                                      children: [
+                                        _buildControlGroup([
+                                          _buildPlayPauseButton(),
+                                          if (widget.episodeListNav != null)
+                                            _buildEpisodeButton(
+                                              enabled: !widget
+                                                  .episodeListNav!.switching,
+                                              icon: Icons.playlist_play_rounded,
+                                              tooltip: '选集',
+                                              onPressed: _toggleEpisodeDrawer,
+                                            ),
+                                          if (widget.episodeNav != null) ...[
+                                            _buildEpisodeButton(
+                                              enabled: widget.episodeNav!.canPrev &&
+                                                  !widget.episodeNav!.switching,
+                                              icon: Icons.skip_previous_rounded,
+                                              tooltip: '上一集 (${_shortcutLabel(PlayerShortcutAction.previousEpisode)})',
+                                              onPressed: _handlePrevEpisode,
+                                            ),
+                                            _buildEpisodeButton(
+                                              enabled: widget.episodeNav!.canNext &&
+                                                  !widget.episodeNav!.switching,
+                                              icon: Icons.skip_next_rounded,
+                                              tooltip: '下一集 (${_shortcutLabel(PlayerShortcutAction.nextEpisode)})',
+                                              onPressed: _handleNextEpisode,
+                                            ),
+                                          ],
+                                          if (widget.replayNav != null)
+                                            _buildEpisodeButton(
+                                              enabled: !widget.replayNav!.busy,
+                                              icon: Icons.replay_rounded,
+                                              tooltip: '重播（从头开始）',
+                                              onPressed: _handleReplay,
+                                            ),
+                                          if (!_isLiveMode && session == null) _buildSpeedSelector(),
+                                          if (_hasQualityChoices)
+                                            _buildQualitySelector(),
+                                        ]),
+                                        _buildControlGroup([
+                                          _buildSkipMarkerButtons(),
+                                          if (widget.segmentsNav != null)
+                                            _buildSegmentsButton(),
+                                          if (_hasDanmaku)
+                                            _buildDanmakuButton(),
+                                          if (_hasDanmakuSearch)
+                                            _buildDanmakuSearchButton(),
+                                          if (_hasDanmakuSettings)
+                                            _buildDanmakuSettingsButton(),
+                                          _buildVolumeControl(),
+                                          if (_hasSettingsEntries)
+                                            _buildSettingsButton(),
+                                          if (_canShowExternalPlayer)
+                                            _buildExternalPlayerButton(),
+                                          _buildPipButton(),
+                                          _buildFullscreenButton(),
+                                        ]),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                    ),
+                  ),
+                ),
+                // 7. 跳过片头浮层胶囊（仅已设片头且当前仍在片头区间内出现）；
+                //    §44 其上是共享片段的执行器（自动跳过 / 静音，1 票时的提示胶囊）。
+                //
+                // 位置固定在控制条之上（2026-10-27 实机反馈「点击时抽搐、点好几下点不到」）：
+                // 原先 bottom 随控制条显隐在 96 / 24 之间跳，而 24 正落在底部热区里——
+                // 鼠标移过去 → 控制条出现 → 胶囊跳走 → 鼠标出热区 → 控制条隐藏 → 胶囊落回，循环。
+                // 现在固定 96，并且指针停在胶囊上时视作「在控制区」：控制条不隐藏、撤销倒计时暂停。
+                Positioned(
+                  right: 24,
+                  bottom: 96,
+                  child: MouseRegion(
+                    onEnter: (_) {
+                      _pointerOnPill = true;
+                      _pointerInChrome = true;
+                      _hideControlsTimer?.cancel();
+                    },
+                    onExit: (_) {
+                      _pointerOnPill = false;
+                    },
+                    child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      if (widget.segmentsNav != null)
+                        SegmentPlaybackRunner(
+                          nav: widget.segmentsNav!,
+                          engine: widget.playerEngine,
+                          onNotice: _osdController.show,
+                        ),
+                      _buildSkipIntroPill(),
+                    ],
+                  ),
+                  ),
+                ),
+
+                // 8. 起播准备态（§16）：解析地址期间盖在最上层。
+                //    没有它时，弱网下点选集要干等几秒才进播放页。
+                if (widget.preparing != null)
+                  PlaybackPreparingOverlay(
+                    intent: widget.preparing!,
+                    onRetry: widget.onRetryPrepare,
+                    onCancel: widget.onCancelPrepare,
+                    sourceSwitchNav:
+                        _canShowSourceActions ? widget.sourceSwitchNav : null,
+                    // 让出顶栏高度，返回按钮才点得到。
+                    topInset: pip ? 0 : 54,
+                  ),
+
+                // 9. §20 选集 + 线路抽屉挂在视频表面层（控制条之下，见 _wrapEpisodeLayer）。
+              ],
+            )),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomControlTooltip(
+      {required String message, required Widget child}) {
+    return Tooltip(
+      message: message,
+      positionDelegate: (position) {
+        final aligned = positionDependentBox(
+          size: position.overlaySize,
+          childSize: position.tooltipSize,
+          target: position.target,
+          verticalOffset: position.verticalOffset,
+          preferBelow: false,
+        );
+        // invariant: 浮层随按钮行隐藏，提示向视频内展开，不受按钮行高度挤压。
+        return Offset(
+          aligned.dx,
+          position.target.dy -
+              position.targetSize.height / 2 -
+              position.tooltipSize.height -
+              8,
+        );
+      },
+      child: child,
+    );
+  }
+
+  /// 控制条图标按钮（切集 / 重播 / 刷新）：禁用态灰显并吸收点击。
+  Widget _buildEpisodeButton({
+    required bool enabled,
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+  }) {
+    final button = _buildBottomControlTooltip(
+      message: tooltip,
+      child: _ControlButton(
+        icon: icon,
+        onPressed: enabled ? onPressed : null,
+      ),
+    );
+    if (enabled) return button;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {},
+      child: button,
+    );
+  }
+
+  /// 控制条文本按钮（片头 / 片尾）：已设置显示时间，未设置显示名称。
+  String _skipLabel(int ms, String fallback) =>
+      ms > 0 ? _formatDuration(Duration(milliseconds: ms)) : fallback;
+
+  /// §44 本集共享片段的时间轴色块（未配置服务 / 未加载完时为空）。
+  Widget _withSegmentMarks(Widget Function(List<SegmentMark> marks) builder) {
+    final nav = widget.segmentsNav;
+    if (nav == null) return builder(const []);
+    return ValueListenableBuilder<SegmentsState>(
+      valueListenable: nav.state,
+      builder: (context, state, _) => builder(
+          segmentMarksFor(state, widget.playerEngine.duration.inMilliseconds)),
+    );
+  }
+
+  Widget _buildProgressBar() {
+    // D4：真直播隐藏进度条（不是只禁用）——Slider 的 max 依赖 duration，
+    // 直播下常为 1 或滑动窗口长度，位置显示会失真，且会诱导用户拖动。
+    if (_isLiveMode) return _buildLiveProgressIndicator();
+    return _withSegmentMarks((marks) => StreamBuilder<Duration>(
+      stream: widget.playerEngine.positionStream,
+      initialData: widget.playerEngine.position,
+      builder: (context, snapshot) {
+        final posMs = _dragSeekPositionMs >= 0
+            ? _dragSeekPositionMs
+            : (snapshot.data?.inMilliseconds.toDouble() ?? 0.0);
+        final durMs = widget.playerEngine.duration.inMilliseconds.toDouble();
+        final maxVal = durMs > 0 ? durMs : 1.0;
+
+        return MouseRegion(
+          onEnter: (_) => setState(() => _progressHovered = true),
+          onExit: (_) => setState(() => _progressHovered = false),
+          child: TweenAnimationBuilder<double>(
+            // 悬停加粗（B5）：轨道 3.5→6、滑点 6→7，200ms 过渡。
+            tween: Tween<double>(end: _progressHovered ? 1.0 : 0.0),
+            duration: _chromeMotion(context, visible: true),
+            curve: AppMotion.ease,
+            builder: (context, t, _) => SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3.5 + 2.5 * t,
+                // §44 片段色块（片头片尾绿、广告黄……）画在轨道上、滑点之下
+                trackShape: SegmentTrackShape(marks),
+                thumbShape: RoundSliderThumbShape(enabledThumbRadius: 6 + t),
+                activeTrackColor: _chromeHighlight,
+                inactiveTrackColor: _chromeTrack,
+                thumbColor: _chromeInk,
+                overlayColor: _chromeHighlight.withValues(alpha: 0.2),
+              ),
+              child: Slider(
+                key: const ValueKey('player-timeline'),
+                value: posMs.clamp(0.0, maxVal),
+                max: maxVal,
+                onChangeStart: durMs > 0 ? _previewSeek : null,
+                onChanged: durMs > 0 ? _previewSeek : null,
+                onChangeEnd: durMs > 0 ? _commitSeek : null,
+              ),
+            ),
+          ),
+        );
+      },
+    ));
+  }
+
+  /// 直播模式下的进度区：`LIVE` 徽标 + 提示，替代 Slider（D4）。
+  ///
+  /// 语义上显式标注「直播中，不支持拖动进度」（不只靠颜色/隐藏表达状态）；
+  /// 高度与 Slider 行接近，避免控制条高度跳动。
+  Widget _buildLiveProgressIndicator() {
+    return Semantics(
+      label: '直播中，不支持拖动进度',
+      enabled: false,
+      child: SizedBox(
+        height: 40,
+        child: Row(
+          key: const ValueKey('player-live-progress'),
+          children: [
+            const LiveIndicator(label: 'LIVE'),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                '直播不支持拖动进度',
+                maxLines: 1,
+                overflow: TextOverflow.fade,
+                softWrap: false,
+                style: TextStyle(
+                  color: _chromeInk.withValues(alpha: 0.72),
+                  fontSize: AppType.caption,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 控制条显隐 / 细线的动画时长（D2：进 200 / 出 140）。
+  ///
+  /// [visible] 为目标显隐态：显 → `AppMotion.enter`，隐 → `AppMotion.exit`。
+  /// 鼠标与键盘路径都汇到 `_showControls` 这一处状态，节奏天然一致；
+  /// 系统开启「减少动画」时瞬切（skill `reduced-motion`）。
+  Duration _chromeMotion(BuildContext context, {required bool visible}) =>
+      MediaQuery.of(context).disableAnimations
+          ? Duration.zero
+          : (visible ? AppMotion.enter : AppMotion.exit);
+
+  /// 底栏隐藏时的常驻细进度线：贴窗口最底、纯展示（`IgnorePointer`）。
+  ///
+  /// - 只反映播放位置（底栏隐藏时本就无法拖动进度）；
+  /// - 直播等无时长（`duration == 0`）时不显示；
+  /// - 控制条可见时透明（层级也在底栏之下，不干扰控制条）。
+  ///
+  /// 配色**刻意不随主题**（2026-10-27 实机反馈）：播放页底下永远是视频画面，
+  /// 浅色主题的 `borderStrong`（#D2D2DC）/ `accentInk`（#334155）压上去又亮又脏。
+  /// 这里直接取播放器 chrome 常量 `_chromeTrack` / `_chromeHighlight`，
+  /// 它们与 `AppPalette.dark` 的对应值逐字节相同 —— 深色主题像素不变，
+  /// 浅色主题则沿用深色那套。
+  Widget _buildMiniProgressLine(BuildContext context) {
+    // 直播不显示常驻细进度线：直链场景里 duration > 0 时它会变成
+    // 「直播却有一条看起来可拖动的时间轴」，与 D4 的口径冲突。
+    if (_isLiveMode) return const SizedBox.shrink();
+    return _withSegmentMarks((marks) => StreamBuilder<Duration>(
+      stream: widget.playerEngine.positionStream,
+      initialData: widget.playerEngine.position,
+      builder: (context, snapshot) {
+        final durMs = widget.playerEngine.duration.inMilliseconds;
+        final hasDuration = durMs > 0;
+        final posMs = (snapshot.data?.inMilliseconds ?? 0)
+            .clamp(0, hasDuration ? durMs : 1);
+        final fraction = hasDuration ? posMs / durMs : 0.0;
+        final visible =
+            widget.showMiniProgress && !_chromeVisible && hasDuration;
+        return IgnorePointer(
+          // 显示度用颜色 alpha 插值表达（不用 Opacity 包裹）：显隐
+          // 不改变子树结构与语义节点。
+          child: TweenAnimationBuilder<double>(
+            key: const ValueKey('player-mini-progress'),
+            tween: Tween<double>(end: visible ? 1.0 : 0.0),
+            duration: _chromeMotion(context, visible: visible),
+            builder: (context, alpha, _) => SizedBox(
+              height: 3,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  ColoredBox(color: _chromeTrack.withValues(alpha: alpha)),
+                  FractionallySizedBox(
+                    alignment: Alignment.centerLeft,
+                    widthFactor: fraction,
+                    child: ColoredBox(
+                        color: _chromeHighlight.withValues(alpha: alpha)),
+                  ),
+                  // §44 片段色块：与进度条同色，底栏隐藏后也看得到片头片尾 / 广告在哪
+                  for (final m in marks)
+                    FractionallySizedBox(
+                      key: ValueKey('player-mini-segment-${m.id}'),
+                      alignment: Alignment(
+                          m.end - m.start >= 1 ? 0 : (m.start / (1 - (m.end - m.start))) * 2 - 1,
+                          0),
+                      widthFactor: m.end - m.start,
+                      child: ColoredBox(
+                          color: m.color.withValues(alpha: m.color.a * alpha)),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    ));
+  }
+
+  // ---------------------------------------------------------------------------
+  // SET-32 控制条精简：一级动作 + 播放设置面板 + 跳过片头浮层胶囊
+  // ---------------------------------------------------------------------------
+
+  /// 控制按钮行统一高度（44）：行内所有入口都在这一行里垂直居中。
+  ///
+  /// 行高不变（`_bottomChromeHeight` 预算依赖它），只是不再把入口拉伸到 44：
+  /// `FocusOutline` 内部是 Stack（topStart 对齐），拉伸会让高度不同的入口
+  /// 在行内各自贴顶，图标中心线因此高低不一（实机「水平高度不符」）。
+  static const double _controlRowHeight = 44;
+
+  Widget _buildControlGroup(List<Widget> controls) => Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          for (final control in controls)
+            SizedBox(
+              height: _controlRowHeight,
+              // 入口按自身高度（`_controlHitSize`）居中，图标中心即行中线。
+              child: Align(
+                alignment: Alignment.center,
+                widthFactor: 1,
+                child: control,
+              ),
+            ),
+        ],
+      );
+
+  Widget _buildPlayPauseButton() {
+    return StreamBuilder<PlaybackStatus>(
+      stream: widget.playerEngine.statusStream,
+      initialData: widget.playerEngine.status,
+      builder: (context, snapshot) {
+        final isPlaying = snapshot.data == PlaybackStatus.playing;
+        return _buildBottomControlTooltip(
+          message: '${isPlaying ? '暂停' : '播放'} '
+              '(${_shortcutLabel(PlayerShortcutAction.playPause)})',
+          child: _ControlButton(
+            icon: isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+            iconSize: 24,
+            onPressed: _togglePlayPause,
+          ),
+        );
+      },
+    );
+  }
+
+  /// 片头 / 片尾快速标记按钮组（无视图模型时整组不显示）。
+  Widget _buildSkipMarkerButtons() {
+    if (widget.skipNav == null) return const SizedBox.shrink();
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _buildSkipMarkerButton(ending: false),
+        _buildSkipMarkerButton(ending: true),
+      ],
+    );
+  }
+
+  /// 快速标记按钮：点击即把当前播放位置设为片头 / 片尾（校验在宿主）。
+  Widget _buildSkipMarkerButton({required bool ending}) {
+    final nav = widget.skipNav;
+    if (nav == null) return const SizedBox.shrink();
+    final valueMs = ending ? nav.endingMs : nav.openingMs;
+    final label = ending ? '片尾' : '片头';
+    final valueText =
+        valueMs > 0 ? _formatDuration(Duration(milliseconds: valueMs)) : null;
+    final message = valueText == null
+        ? '$label（未设置）：点击设为当前位置'
+        : (ending
+            ? '$label（距结尾 $valueText）：点击设为当前位置'
+            : '$label（当前 $valueText）：点击设为当前位置');
+    return _buildBottomControlTooltip(
+      message: message,
+      child: FocusOutline(
+        radius: AppRadii.pill,
+        // 纯文字入口也占同一个 36×36 点击盒：与图标按钮同一条中线、同一高度。
+        child: SizedBox(
+          height: _controlHitSize,
+          child: TextButton(
+            onPressed: ending ? _handleEndingSkip : _handleOpeningSkip,
+            style: TextButton.styleFrom(
+              foregroundColor: valueMs > 0 ? _chromeHighlight : _chromeInk,
+              // 竖向内边距归零，高度由 36 盒与 minimumSize 决定（不靠 padding 凑）。
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: const Size(0, _controlHitSize),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              visualDensity: VisualDensity.standard,
+              overlayColor: _chromeInk.withValues(alpha: 0.12),
+            ),
+            child: Text(label,
+                style: const TextStyle(
+                    fontSize: AppType.body, fontWeight: FontWeight.bold)),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 时间标签：固定在进度条行右端，不随任何滚动或按钮增减移动。
+  ///
+  /// 直播没有「总时长」概念：改为「直播 · 已播 mm:ss」，不显示 `pos / dur`。
+  Widget _buildTimeLabel() {
+    return StreamBuilder<Duration>(
+      stream: widget.playerEngine.positionStream,
+      initialData: widget.playerEngine.position,
+      builder: (context, snapshot) {
+        final pos = !_isLiveMode && _isDraggingSeek
+            ? Duration(milliseconds: _dragSeekPositionMs.toInt())
+            : snapshot.data ?? Duration.zero;
+        final dur = widget.playerEngine.duration;
+        return SizedBox(
+          width: 108,
+          child: Text(
+            _isLiveMode
+                ? '直播 · 已播 ${_formatDuration(pos)}'
+                : '${_formatDuration(pos)} / ${_formatDuration(dur)}',
+            maxLines: 1,
+            overflow: TextOverflow.fade,
+            softWrap: false,
+            textAlign: TextAlign.right,
+            style: const TextStyle(color: _chromeInk, fontSize: AppType.body),
+          ),
+        );
+      },
+    );
+  }
+
+  bool get _hasDanmaku =>
+      widget.liveDanmakuNav != null || widget.danmakuNav != null;
+
+  bool get _hasDanmakuSettings =>
+      widget.liveDanmakuNav != null ||
+      widget.danmakuNav?.onSettingsChanged != null;
+
+  /// 「搜索弹幕」入口：仅点播弹幕 + 宿主接上了手动搜索 + 弹幕开关开着时显示。
+  ///
+  /// 关着弹幕时不显示：搜索完也看不见效果，先开弹幕再换源（与「弹」按钮一致）。
+  bool get _hasDanmakuSearch =>
+      widget.liveDanmakuNav == null &&
+      widget.danmakuNav?.searchController != null &&
+      widget.danmakuNav!.enabled;
+
+  String _liveDanmakuStatusLabel(PlayerLiveDanmakuNav nav) {
+    switch (nav.status()) {
+      case LiveDanmakuStatus.idle:
+        return '直播弹幕待连接';
+      case LiveDanmakuStatus.connecting:
+        return '直播弹幕连接中';
+      case LiveDanmakuStatus.ready:
+        return '直播弹幕已连接';
+      case LiveDanmakuStatus.retrying:
+        return '直播弹幕重连中';
+      case LiveDanmakuStatus.error:
+        final error = nav.error()?.trim();
+        return error == null || error.isEmpty
+            ? '直播弹幕连接失败'
+            : '直播弹幕连接失败：$error';
+      case LiveDanmakuStatus.closed:
+        return '直播弹幕已断开';
+    }
+  }
+
+  /// 开关读取最新来源，使快捷键和已打开的设置抽屉共用宿主状态。
+  void _handleToggleDanmaku() {
+    final liveNav = widget.liveDanmakuNav;
+    if (liveNav != null) {
+      final turningOn = !liveNav.enabled.value;
+      liveNav.onToggle();
+      _osdController.show(
+        turningOn ? Icons.subtitles_rounded : Icons.subtitles_off_rounded,
+        turningOn
+            ? (liveNav.status() == LiveDanmakuStatus.ready
+                ? '弹幕已开启'
+                : '弹幕已开启 · ${_liveDanmakuStatusLabel(liveNav)}')
+            : '弹幕已关闭',
+      );
+      return;
+    }
+    final nav = widget.danmakuNav;
+    if (nav == null) return;
+    final turningOn = !nav.enabled;
+    nav.onToggle();
+    final state = nav.state.value;
+    _osdController.show(
+      turningOn ? Icons.subtitles_rounded : Icons.subtitles_off_rounded,
+      turningOn
+          ? (state.phase == DanmakuLoadPhase.ready
+              ? '弹幕已开启'
+              : '弹幕已开启 · ${state.label}')
+          : '弹幕已关闭',
+    );
+  }
+
+  Widget _buildDanmakuLayer({required bool pip}) {
+    final liveNav = widget.liveDanmakuNav;
+    if (liveNav != null) {
+      return ListenableBuilder(
+        listenable: Listenable.merge([
+          liveNav.enabled,
+          liveNav.settings,
+          widget.windowManager.isFullScreenNotifier,
+        ]),
+        builder: (context, _) {
+          if (!liveNav.enabled.value) return const SizedBox.shrink();
+          final settings = liveNav.settings.value;
+          final fullScreen = widget.windowManager.isFullScreenNotifier.value;
+          return StreamBuilder<PlaybackStatus>(
+            stream: widget.playerEngine.statusStream,
+            initialData: widget.playerEngine.status,
+            builder: (context, status) => LayoutBuilder(
+              builder: (context, box) => LiveDanmakuLayer(
+                messages: liveNav.messages,
+                playing: status.data == PlaybackStatus.playing,
+                settings: settings,
+                fontSize: pip
+                    ? pipDanmakuFontSize(settings.fontSize, box.maxHeight)
+                    : (fullScreen
+                        ? settings.fullscreenFontSize
+                        : settings.fontSize),
+                area: pip ? settings.pipArea : settings.area,
+              ),
+            ),
+          );
+        },
+      );
+    }
+    final nav = widget.danmakuNav!;
+    if (!nav.enabled) return const SizedBox.shrink();
+    final settings = nav.settings;
+    return ValueListenableBuilder<DanmakuState>(
+      valueListenable: nav.state,
+      builder: (context, state, _) {
+        final track = state.track;
+        if (state.phase != DanmakuLoadPhase.ready || track == null) {
+          return const SizedBox.shrink();
+        }
+        return StreamBuilder<PlaybackStatus>(
+          stream: widget.playerEngine.statusStream,
+          initialData: widget.playerEngine.status,
+          builder: (context, status) => StreamBuilder<double>(
+            stream: widget.playerEngine.rateStream,
+            initialData: widget.playerEngine.rate,
+            builder: (context, rate) => ValueListenableBuilder<bool>(
+              valueListenable: widget.windowManager.isFullScreenNotifier,
+              builder: (context, fullScreen, _) => LayoutBuilder(
+                builder: (context, box) => DanmakuLayer(
+                  key: ValueKey('danmaku-${state.requestKey}'),
+                  track: track,
+                  positionStream: widget.playerEngine.positionStream,
+                  initialPosition: widget.playerEngine.position,
+                  playing: status.data == PlaybackStatus.playing,
+                  rate: rate.data ?? 1.0,
+                  settings: settings,
+                  fontSize: pip
+                      ? pipDanmakuFontSize(settings.fontSize, box.maxHeight)
+                      : (fullScreen
+                          ? settings.fullscreenFontSize
+                          : settings.fontSize),
+                  area: pip ? settings.pipArea : settings.area,
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// §44「片段」入口：右侧抽屉，提交本集片段（开始 / 结束 / 分类 / 动作）并查看他人共享的片段。
+  Widget _buildSegmentsButton() {
+    return _buildBottomControlTooltip(
+      message: '片段（共享跳过）',
+      child: _ControlButton(
+        key: const ValueKey('player-segments'),
+        icon: Icons.content_cut_rounded,
+        onPressed: _openSegments,
+      ),
+    );
+  }
+
+  Future<void> _openSegments() async {
+    final nav = widget.segmentsNav;
+    if (nav == null) return;
+    await _runSideDrawer(
+      width: 380,
+      barrierLabel: '关闭片段',
+      builder: (_) => SegmentPanel(
+        nav: nav,
+        position: () => widget.playerEngine.position,
+        duration: () => widget.playerEngine.duration,
+        onSeek: (d) => unawaited(widget.playerEngine.seek(d)),
+      ),
+    );
+  }
+
+  /// §43 弹幕设置入口：右侧抽屉，播放中直接调外观 / 屏蔽 / 区域。
+  Widget _buildDanmakuSettingsButton() {
+    return _buildBottomControlTooltip(
+      message: '弹幕设置',
+      child: _ControlButton(
+        key: const ValueKey('player-danmaku-settings'),
+        icon: Icons.tune_rounded,
+        onPressed: _openDanmakuSettings,
+      ),
+    );
+  }
+
+  Future<void> _openDanmakuSettings() async {
+    if (!_hasDanmakuSettings) return;
+    final liveNav = widget.liveDanmakuNav;
+    final nav = widget.danmakuNav;
+    await _runSideDrawer(
+      width: 360,
+      barrierLabel: '关闭弹幕设置',
+      builder: (_) => DanmakuSettingsPanel(
+        initial: liveNav?.settings.value ?? nav!.settings,
+        enabled: liveNav?.enabled.value ?? nav!.enabled,
+        onChanged: (value) {
+          final currentLiveNav = widget.liveDanmakuNav;
+          if (currentLiveNav != null) {
+            currentLiveNav.onSettingsChanged(value);
+          } else {
+            widget.danmakuNav?.onSettingsChanged?.call(value);
+          }
+        },
+        onToggle: _handleToggleDanmaku,
+        showSourceSelector: liveNav == null,
+      ),
+    );
+  }
+
+  /// 「搜索弹幕」：弹窗里按关键词搜候选，选中一条即换源并立即刷新屏幕上的弹幕。
+  Widget _buildDanmakuSearchButton() {
+    return _buildBottomControlTooltip(
+      message: '搜索弹幕',
+      child: _ControlButton(
+        key: const ValueKey('player-danmaku-search'),
+        icon: Icons.manage_search_rounded,
+        onPressed: _openDanmakuSearch,
+      ),
+    );
+  }
+
+  Future<void> _openDanmakuSearch() async {
+    final controller = widget.danmakuNav?.searchController;
+    if (controller == null) return;
+    final before = controller.value.candidate?.url;
+    await showDanmakuSearchDialog(
+      context: context,
+      controller: controller,
+      onSourceChanged: widget.danmakuNav?.onSettingsChanged == null
+          ? null
+          : (source) {
+              final nav = widget.danmakuNav;
+              nav?.onSettingsChanged?.call(nav.settings.copyWith(source: source));
+            },
+    );
+    if (!mounted) return;
+    final after = controller.value;
+    // 弹窗选中后自己关掉：这里补一个 OSD，确认换源已经生效
+    if (after.phase == DanmakuLoadPhase.ready &&
+        after.candidate?.url != before) {
+      _osdController.show(Icons.subtitles_rounded, '弹幕已切换');
+    }
+  }
+
+  /// 「弹」按钮：开 / 关两种图标；开启且加载中时右上角一个小圆点。
+  Widget _buildDanmakuButton() {
+    final liveNav = widget.liveDanmakuNav;
+    if (liveNav != null) {
+      return ListenableBuilder(
+        listenable: Listenable.merge([liveNav.enabled, liveNav.state]),
+        builder: (context, _) {
+          final enabled = liveNav.enabled.value;
+          final status = liveNav.status();
+          final keys = _shortcutLabel(PlayerShortcutAction.toggleDanmaku);
+          final tip = !enabled
+              ? '开启弹幕 ($keys)'
+              : (status == LiveDanmakuStatus.ready
+                  ? '关闭弹幕 ($keys)'
+                  : '关闭弹幕 ($keys) · ${_liveDanmakuStatusLabel(liveNav)}');
+          return _buildDanmakuToggleControl(
+            enabled: enabled,
+            busy: status == LiveDanmakuStatus.connecting ||
+                status == LiveDanmakuStatus.retrying,
+            message: tip,
+          );
+        },
+      );
+    }
+    final nav = widget.danmakuNav!;
+    return ValueListenableBuilder<DanmakuState>(
+      valueListenable: nav.state,
+      builder: (context, state, _) {
+        // 已加载时只提示快捷键；加载中 / 失败才附带状态（不显示条数）
+        final keys = _shortcutLabel(PlayerShortcutAction.toggleDanmaku);
+        final tip = !nav.enabled
+            ? '开启弹幕 ($keys)'
+            : (state.phase == DanmakuLoadPhase.ready
+                ? '关闭弹幕 ($keys)'
+                : '关闭弹幕 ($keys) · ${state.label}');
+        return _buildDanmakuToggleControl(
+          enabled: nav.enabled,
+          busy: state.busy,
+          message: tip,
+        );
+      },
+    );
+  }
+
+  Widget _buildDanmakuToggleControl({
+    required bool enabled,
+    required bool busy,
+    required String message,
+  }) {
+    return _buildBottomControlTooltip(
+      message: message,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          _ControlButton(
+            key: const ValueKey('player-danmaku-toggle'),
+            icon: enabled
+                ? Icons.subtitles_rounded
+                : Icons.subtitles_off_rounded,
+            iconSize: 21,
+            onPressed: _handleToggleDanmaku,
+          ),
+          if (enabled && busy)
+            const Positioned(
+              right: 6,
+              top: 6,
+              child: SizedBox(
+                width: 6,
+                height: 6,
+                child: DecoratedBox(
+                  key: ValueKey('player-danmaku-busy'),
+                  decoration: BoxDecoration(
+                      color: _chromeHighlight, shape: BoxShape.circle),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFullscreenButton() {
+    return _buildBottomControlTooltip(
+      message: '全屏 (${_shortcutLabel(PlayerShortcutAction.toggleFullscreen)} / 双击)',
+      child: _ControlButton(
+        icon: Icons.fullscreen_rounded,
+        iconSize: 22,
+        onPressed: () => widget.windowManager.toggleFullScreen(),
+      ),
+    );
+  }
+
+  void _launchExternalPlayer() {
+    final nav = widget.externalNav;
+    if (!_canShowExternalPlayer || nav == null || !nav.enabled || nav.busy) return;
+    _onUserActivity();
+    nav.onLaunch();
+  }
+
+  Widget _buildExternalPlayerButton() {
+    final nav = widget.externalNav!;
+    final status = nav.statusText?.trim();
+    final label = nav.busy ? '正在打开外部播放器…' : '外部播放器';
+    return _buildBottomControlTooltip(
+      message: status == null || status.isEmpty ? label : '$label · $status',
+      child: _ControlButton(
+        key: const ValueKey('player-external-launch'),
+        icon: Icons.open_in_new_rounded,
+        busy: nav.busy,
+        onPressed: nav.enabled && !nav.busy ? _launchExternalPlayer : null,
+      ),
+    );
+  }
+
+  /// 「画中画」入口：缩小为置顶小窗，返回键还原，拖画面可换位。
+  Widget _buildPipButton() {
+    return _buildBottomControlTooltip(
+      message: '画中画（小窗悬浮播放，${_shortcutLabel(PlayerShortcutAction.exitFullscreen)} 还原）',
+      child: _ControlButton(
+        icon: Icons.picture_in_picture_alt_rounded,
+        iconSize: 22,
+        onPressed: () => unawaited(widget.windowManager.enterPip()),
+      ),
+    );
+  }
+
+  /// PiP 精简控制条：还原、播放/暂停、进度与时间。
+  Widget _buildPipCompactBar() {
+    return Container(
+      key: const ValueKey('player-bottom-bar-pip'),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.bottomCenter,
+          end: Alignment.topCenter,
+          colors: [_chromeScrim, _chromeScrimFade],
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Overlay.wrap(
+                  alwaysSizeToContent: true,
+                  clipBehavior: Clip.none,
+                  child: _buildProgressBar(),
+                ),
+              ),
+              const SizedBox(width: 10),
+              _buildTimeLabel(),
+            ],
+          ),
+          const SizedBox(height: 2),
+          SizedBox(
+            height: 40,
+            child: Overlay.wrap(
+              clipBehavior: Clip.none,
+              child: Row(
+                children: [
+                  _buildBottomControlTooltip(
+                    message: '还原窗口 (${_shortcutLabel(PlayerShortcutAction.exitFullscreen)})',
+                    child: _ControlButton(
+                      icon: Icons.open_in_full_rounded,
+                      iconSize: 22,
+                      onPressed: () {
+                        unawaited(widget.windowManager.exitPip());
+                        _osdController.show(
+                            Icons.open_in_full_rounded, '已还原窗口');
+                      },
+                    ),
+                  ),
+                  _buildPlayPauseButton(),
+                  const Spacer(),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _setQualityMenuOpen(bool open) {
+    if (!mounted) return;
+    if (open) _holdGesture.cancel();
+    setState(() {
+      _qualityMenuOpen = open;
+      if (open) _showControls = true;
+    });
+    _startHideTimer();
+  }
+
+  void _selectQuality(int index, List<String> expectedNames) {
+    final nav = widget.qualityNav;
+    if (!_hasQualityChoices || nav == null || nav.busy ||
+        index == nav.selectedIndex || index < 0 || index >= nav.names.length ||
+        !listEquals(nav.names, expectedNames)) {
+      return;
+    }
+    nav.onSelect(index);
+  }
+
+  Widget _buildQualitySelector() {
+    final nav = widget.qualityNav!;
+    return FocusOutline(
+      radius: AppRadii.pill,
+      child: PopupMenuButton<int>(
+        key: const ValueKey('player-quality-menu'),
+        tooltip: nav.busy ? '正在切换${nav.label}' : nav.label,
+        color: context.palette.raised,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadii.md),
+        ),
+        enabled: !nav.busy,
+        onOpened: () => _setQualityMenuOpen(true),
+        onCanceled: () => _setQualityMenuOpen(false),
+        onSelected: (index) {
+          _setQualityMenuOpen(false);
+          _selectQuality(index, nav.names);
+        },
+        itemBuilder: (_) => [
+          for (var index = 0; index < nav.names.length; index++)
+            CheckedPopupMenuItem<int>(
+              key: ValueKey('player-quality-option-$index'),
+              value: index,
+              checked: index == nav.selectedIndex,
+              enabled: !nav.busy && index != nav.selectedIndex,
+              child: Text(nav.names[index], maxLines: 2, overflow: TextOverflow.ellipsis),
+            ),
+        ],
+        // 清晰度入口：36 高统一点击盒，文案 / 忙碌圈 / 箭头共用同一条垂直中线。
+        child: SizedBox(
+          height: _controlHitSize,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (nav.busy) ...[
+                  const SizedBox.square(
+                    dimension: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: _chromeInk),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 92),
+                  child: Text(nav.currentName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: _chromeInk, fontSize: AppType.body),
+                  ),
+                ),
+                const Icon(Icons.expand_more_rounded, size: 16, color: _chromeInk),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _embeddedVideo(EmbeddedPlaybackSession session) => StreamBuilder<VideoDimensions>(
+    stream: widget.playerEngine.dimensionsStream,
+    initialData: widget.playerEngine.dimensions,
+    builder: (context, snapshot) {
+      final ratio = switch (widget.scale) {
+        '16:9' => 16 / 9,
+        '4:3' => 4 / 3,
+        _ => snapshot.data?.aspectRatio ?? 16 / 9,
+      };
+      return ColoredBox(color: Colors.black, child: ClipRect(child: FittedBox(
+        fit: videoFitForScale(widget.scale),
+        child: SizedBox(width: ratio * 100, height: 100, child: Texture(
+          key: ValueKey('embedded-video-${session.backend.name}'),
+          textureId: session.textureId,
+        )),
+      )));
+    },
+  );
+
+  /// 只要还有任何「设置项」就显示齿轮入口，避免空面板。
+  bool get _hasSettingsEntries =>
+      widget.embeddedPlayback != null ||
+      widget.onScaleChanged != null ||
+      widget.subtitleTracksNav != null ||
+      widget.audioTracksNav != null ||
+      widget.videoTracksNav != null ||
+      widget.refreshNav != null ||
+      widget.resetNav != null ||
+      widget.skipNav != null ||
+      _hasQualityChoices ||
+      (_canShowSourceActions && widget.sourceSwitchNav != null) ||
+      (widget.playerInfoLabel?.trim().isNotEmpty ?? false);
+
+  Widget _buildSettingsButton() {
+    return _buildBottomControlTooltip(
+      message: '播放设置',
+      child: _ControlButton(
+        icon: Icons.settings_rounded,
+        onPressed: _openSettingsPanel,
+      ),
+    );
+  }
+
+  /// 面板是否已打开：防止连点齿轮叠出多层对话框。
+  bool _panelOpen = false;
+
+  /// 「播放设置」：§43 验收反馈后由居中对话框改为右侧抽屉（与「弹幕设置」同一形态）。
+  /// §50 设置面板打开时回读一次实际解码状态（只读诊断，不随帧刷新）。
+  Future<DecodeDiagnostics?> _decodeDiagnostics = Future.value(null);
+
+  Future<DecodeDiagnostics?> _readDecodeDiagnostics() {
+    try {
+      return widget.playerEngine.readDecodeDiagnostics();
+    } catch (_) {
+      // 测试替身 / 引擎未就绪：不显示解码行
+      return Future.value(null);
+    }
+  }
+
+  Future<void> _openSettingsPanel() async {
+    if (_panelOpen) return;
+    _decodeDiagnostics = _readDecodeDiagnostics();
+    var panelAlive = true;
+    await _runSideDrawer(
+      width: 340,
+      barrierLabel: '关闭设置',
+      builder: (_) => StatefulBuilder(
+        builder: (context, setPanelState) {
+          void refreshPanel() {
+            if (panelAlive && mounted) setPanelState(() {});
+          }
+          _refreshSettingsPanel = refreshPanel;
+          return _buildSettingsPanel(context, refreshPanel);
+        },
+      ),
+    );
+    panelAlive = false;
+    _refreshSettingsPanel = null;
+  }
+
+  /// 打开右侧抽屉；同一时刻只开一个（防连点叠层），期间不自动隐藏控制条。
+  Future<void> _runSideDrawer({
+    required double width,
+    required String barrierLabel,
+    required WidgetBuilder builder,
+  }) async {
+    if (_panelOpen) return;
+    _holdGesture.cancel();
+    setState(() => _panelOpen = true);
+    _onUserActivity();
+    _hideControlsTimer?.cancel();
+    try {
+      await showPlayerSideDrawer<void>(
+        context: context,
+        width: width,
+        barrierLabel: barrierLabel,
+        builder: builder,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _panelOpen = false);
+        _startHideTimer();
+      }
+    }
+  }
+
+  Widget _buildSettingsPanel(BuildContext context, VoidCallback refreshPanel) {
+    final imageRows = <Widget>[];
+    final trackRows = <Widget>[];
+    final lineRows = <Widget>[];
+    final qualityRows = <Widget>[];
+    final playRows = <Widget>[];
+    final skipRows = <Widget>[];
+
+    // 画面：画面比例（单选，与设置中心同源）
+    if (widget.onScaleChanged != null) {
+      imageRows.add(_buildScaleSelector(
+        rowBuilder: (label) => _panelRow(
+          icon: Icons.aspect_ratio_rounded,
+          label: '画面比例',
+        ),
+        onSelectionHandled: refreshPanel,
+      ));
+    }
+
+    // 轨道：字幕 / 音轨 / 视轨（各自内联列表）
+    if (!_usingEmbedded && widget.subtitleTracksNav != null) {
+      trackRows.add(_buildSubtitleSelector(
+        rowBuilder: (tracks) => _panelRow(
+          icon: Icons.subtitles_rounded,
+          label: '字幕',
+          value: tracks.any((t) => t.isSelected)
+              ? tracks.firstWhere((t) => t.isSelected).displayName
+              : '已关闭',
+        ),
+        onSelectionHandled: refreshPanel,
+      ));
+    } else if (_usingEmbedded && widget.subtitleTracksNav?.readSession != null) {
+      trackRows.add(_panelRow(
+        icon: Icons.subtitles_rounded,
+        label: '字幕需切换到 mpv',
+        trailing: const SizedBox.shrink(),
+      ));
+    }
+    if (!_usingEmbedded && widget.audioTracksNav != null) {
+      trackRows.add(_buildAudioSelector(
+        rowBuilder: (tracks) => _panelRow(
+          icon: Icons.audiotrack_rounded,
+          label: '音轨',
+          value: tracks.isEmpty
+              ? null
+              : tracks
+                  .firstWhere((t) => t.isSelected, orElse: () => tracks.first)
+                  .displayName,
+        ),
+        onSelectionHandled: refreshPanel,
+      ));
+    }
+    if (!_usingEmbedded && widget.videoTracksNav != null) {
+      trackRows.add(_buildVideoSelector(
+        rowBuilder: (tracks, selectedId) => _panelRow(
+          icon: Icons.video_settings_rounded,
+          label: '视轨',
+          value: switch (selectedId) {
+            'auto' => '自动选择',
+            'no' => '已关闭',
+            _ => tracks
+                .firstWhere((t) => 'video:${t.id}' == selectedId,
+                    orElse: () => tracks.first)
+                .displayName,
+          },
+        ),
+        onSelectionHandled: refreshPanel,
+      ));
+    }
+
+    final qualityNav = widget.qualityNav;
+    if (_hasQualityChoices && qualityNav != null) {
+      for (var index = 0; index < qualityNav.names.length; index++) {
+        final selected = index == qualityNav.selectedIndex;
+        qualityRows.add(_panelActionRow(
+          icon: selected ? Icons.check_circle_rounded : Icons.high_quality_rounded,
+          label: qualityNav.names[index],
+          value: qualityNav.busy ? '切换中…' : (selected ? '当前${qualityNav.label}' : null),
+          enabled: !qualityNav.busy && !selected,
+          onTap: () {
+            Navigator.of(context).pop();
+            _selectQuality(index, qualityNav.names);
+          },
+        ));
+      }
+    }
+
+    final sourceNav = widget.sourceSwitchNav;
+    if (_canShowSourceActions && sourceNav != null) {
+      playRows.add(_panelActionRow(
+        icon: Icons.travel_explore_rounded,
+        label: sourceNav.busy ? '正在查找…' : '换源继续播放',
+        value: sourceNav.statusText,
+        enabled: sourceNav.enabled && !sourceNav.busy,
+        onTap: () {
+          final current = widget.sourceSwitchNav;
+          if (current == null || !current.enabled || current.busy) return;
+          Navigator.of(context).pop();
+          current.onSearch();
+        },
+      ));
+      if (sourceNav.busy && sourceNav.onCancel != null) {
+        playRows.add(_panelActionRow(
+          icon: Icons.close_rounded,
+          label: '取消查找',
+          onTap: () {
+            Navigator.of(context).pop();
+            widget.sourceSwitchNav?.onCancel?.call();
+          },
+        ));
+      }
+    }
+
+    // 播放：刷新
+    final refreshNav = widget.refreshNav;
+    if (refreshNav != null) {
+      playRows.add(_panelActionRow(
+        icon: Icons.refresh_rounded,
+        label: '刷新',
+        value: refreshNav.busy ? '刷新中…' : null,
+        enabled: !refreshNav.busy,
+        onTap: () {
+          Navigator.of(context).pop();
+          _handleRefresh();
+        },
+      ));
+    }
+
+    // 播放：片头 / 片尾（点击即设为当前位置；已设时行尾可清除）
+    final skipNav = widget.skipNav;
+    if (skipNav != null) {
+      skipRows.add(_panelActionRow(
+        icon: Icons.skip_next_rounded,
+        label: '片头',
+        value: _skipLabel(skipNav.openingMs, '未设置'),
+        onTap: () {
+          Navigator.of(context).pop();
+          _handleOpeningSkip();
+        },
+        trailing: skipNav.openingMs > 0
+            ? _buildPanelClearButton(
+                tooltip: '清除片头',
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _handleClearOpeningSkip();
+                })
+            : null,
+      ));
+      skipRows.add(_panelActionRow(
+        icon: Icons.skip_previous_rounded,
+        label: '片尾',
+        value: _skipLabel(skipNav.endingMs, '未设置'),
+        onTap: () {
+          Navigator.of(context).pop();
+          _handleEndingSkip();
+        },
+        trailing: skipNav.endingMs > 0
+            ? _buildPanelClearButton(
+                tooltip: '清除片尾',
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _handleClearEndingSkip();
+                })
+            : null,
+      ));
+    }
+
+    // 危险操作：重置（危险色，仍走确认框）
+    final resetNav = widget.resetNav;
+    if (resetNav != null) {
+      playRows.add(_panelActionRow(
+        icon: Icons.restart_alt_rounded,
+        label: '重置播放器数据',
+        danger: true,
+        enabled: resetNav.enabled,
+        onTap: () {
+          Navigator.of(context).pop();
+          _confirmReset();
+        },
+      ));
+    }
+
+    // 线路：手动换线（SET-12 重做）。当前线路勾选、已失败灰显，都不可点。
+    final lineNav = widget.lineNav;
+    if (lineNav != null && lineNav.options.length > 1) {
+      for (final option in lineNav.options) {
+        final enabled = !lineNav.busy && !option.current && !option.unavailable;
+        lineRows.add(_panelActionRow(
+          icon: option.current
+              ? Icons.check_circle_rounded
+              : Icons.swap_horiz_rounded,
+          label: option.name,
+          value: option.current ? '当前线路' : (option.unavailable ? '已失败' : null),
+          enabled: enabled,
+          onTap: () {
+            Navigator.of(context).pop();
+            lineNav.onSelect(option.index);
+          },
+        ));
+      }
+    }
+
+    final sections = <Widget>[
+      if (widget.embeddedPlayback != null && widget.playerEngine.currentSpec != null)
+        NativePlaybackChoices(engine: widget.playerEngine, onSwitched: () {
+          if (ModalRoute.of(context)?.isCurrent == true) Navigator.of(context).pop();
+        }),
+      if (imageRows.isNotEmpty) ...[_panelSection('画面'), ...imageRows],
+      if (trackRows.isNotEmpty) ...[_panelSection('轨道'), ...trackRows],
+      if (qualityRows.isNotEmpty) ...[_panelSection(qualityNav!.label), ...qualityRows],
+      if (lineRows.isNotEmpty) ...[_panelSection('线路'), ...lineRows],
+      if (playRows.isNotEmpty) ...[_panelSection('播放'), ...playRows],
+      if (skipRows.isNotEmpty) ...[_panelSection('跳过'), ...skipRows],
+    ];
+
+    final infoLabel = widget.embeddedPlayback?.value?.backend.label ?? widget.playerInfoLabel?.trim() ?? '';
+    return PlayerSideDrawerFrame(
+      key: const ValueKey('player-settings-panel'),
+      icon: Icons.settings_rounded,
+      title: '播放设置',
+      closeTooltip: '关闭设置',
+      footer: infoLabel.isEmpty
+          ? null
+          : Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (!_usingEmbedded) _buildDecodeRow(),
+                _panelRow(
+                  icon: Icons.info_outline_rounded,
+                  label: '播放器',
+                  value: infoLabel,
+                ),
+              ],
+            ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: sections,
+      ),
+    );
+  }
+
+  /// §50 实际解码行：期望硬解却回落软解时标红，提示可能是片源格式或显卡不支持。
+  Widget _buildDecodeRow() {
+    return FutureBuilder<DecodeDiagnostics?>(
+      future: _decodeDiagnostics,
+      builder: (context, snapshot) {
+        final d = snapshot.data;
+        if (d == null || !d.hasVideo) return const SizedBox.shrink();
+        final fellBack = d.fellBackToSoftware;
+        return Tooltip(
+          message: fellBack
+              ? '已选硬件解码，但当前片源或显卡不支持，mpv 已回落软件解码（CPU 占用会更高）'
+              : d.summary,
+          child: _panelRow(
+            key: const ValueKey('player-decode-diagnostics'),
+            icon: Icons.memory_rounded,
+            label: '解码',
+            value: fellBack ? '硬解不可用 · ${d.summary}' : d.summary,
+            danger: fellBack,
+            trailing: const SizedBox.shrink(),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 面板分组标题。
+  Widget _panelSection(String title) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 2),
+      child: Text(
+        title,
+        style: TextStyle(
+          color: context.palette.textDim,
+          fontSize: AppType.caption,
+          letterSpacing: 0.5,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  /// 面板只读行 / 弹层入口行（点击由内层 `PopupMenuButton` 负责）。
+  ///
+  /// [trailing] 缺省为右向箭头；片头 / 片尾行在已设值时传入清除按钮。
+  Widget _panelRow({
+    Key? key,
+    required IconData icon,
+    required String label,
+    String? value,
+    bool danger = false,
+    Widget? trailing,
+  }) {
+    return SizedBox(
+      key: key,
+      height: 40,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        child: Row(
+          children: [
+            Icon(icon,
+                size: 18,
+                color: danger
+                    ? context.palette.danger
+                    : context.palette.playerText.withValues(alpha: 0.7)),
+            const SizedBox(width: 10),
+            Expanded(
+              flex: value == null ? 1 : 2,
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: danger
+                      ? context.palette.danger
+                      : context.palette.playerText,
+                  fontSize: AppType.label,
+                ),
+              ),
+            ),
+            if (value != null)
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.only(left: 8),
+                  child: Text(
+                    value,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                    style: TextStyle(
+                        color: context.palette.textSub, fontSize: AppType.body),
+                  ),
+                ),
+              ),
+            trailing ??
+                Icon(Icons.chevron_right_rounded,
+                    size: 16, color: context.palette.textDim),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 面板动作行（刷新 / 片头 / 片尾 / 重置）。
+  Widget _panelActionRow({
+    required IconData icon,
+    required String label,
+    String? value,
+    bool enabled = true,
+    bool danger = false,
+    Widget? trailing,
+    required VoidCallback onTap,
+  }) {
+    final row = _panelRow(
+        icon: icon,
+        label: label,
+        value: value,
+        danger: danger && enabled,
+        trailing: trailing);
+    return FocusOutline(
+      radius: AppRadii.sm,
+      inset: const EdgeInsets.symmetric(horizontal: 8),
+      child: SizedBox(
+        height: 40,
+        child: InkWell(
+          onTap: enabled ? onTap : null,
+          child: Opacity(opacity: enabled ? 1.0 : 0.4, child: row),
+        ),
+      ),
+    );
+  }
+
+  /// 面板行尾清除按钮（仅片头 / 片尾已设时出现）。
+  Widget _buildPanelClearButton(
+      {required String tooltip, required VoidCallback onPressed}) {
+    return FocusOutline(
+      radius: AppRadii.pill,
+      child: IconButton(
+        icon:
+            Icon(Icons.close_rounded, size: 16, color: context.palette.textDim),
+        tooltip: tooltip,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+        onPressed: onPressed,
+      ),
+    );
+  }
+
+  /// 跳过片头胶囊：仅在已设片头且当前播放位置仍落在片头区间内时出现。
+  Widget _buildSkipIntroPill() {
+    final nav = widget.skipNav;
+    if (nav == null || nav.openingMs <= 0 || !nav.enabled) {
+      return const SizedBox.shrink();
+    }
+    return StreamBuilder<Duration>(
+      stream: widget.playerEngine.positionStream,
+      initialData: widget.playerEngine.position,
+      builder: (context, snapshot) {
+        final posMs = (snapshot.data ?? Duration.zero).inMilliseconds;
+        if (posMs < 0 || posMs >= nav.openingMs) {
+          return const SizedBox.shrink();
+        }
+        return FocusOutline(
+          radius: AppRadii.pill,
+          // 胶囊是固定浅底深字（与主题无关）——焦点描边与悬停沿用同一固定
+          // 深色系，保证压在任意画面上都清晰（focus-states / focus-appearance）。
+          color: const Color(0xFF101014),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(AppRadii.pill),
+              hoverColor: const Color(0xFF101014).withValues(alpha: 0.08),
+              onTap: () {
+                widget.playerEngine.seek(Duration(milliseconds: nav.openingMs));
+                _osdController.show(Icons.skip_next_rounded, '已跳过片头');
+                _onUserActivity();
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
+                decoration: BoxDecoration(
+                  // 「跳过片头」胶囊固定浅底深字：压在任意视频画面上都要醒目，
+                  // 与主题无关；下方文字与图标同属这套固定配色。
+                  color: const Color(0xE6FFFFFF),
+                  borderRadius: BorderRadius.circular(AppRadii.pill),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      '跳过片头',
+                      style: TextStyle(
+                        color: Color(0xFF101014),
+                        fontSize: AppType.body,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    SizedBox(width: 4),
+                    Icon(Icons.skip_next_rounded,
+                        size: 16, color: Color(0xFF101014)),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 菜单项「图标 + 文案」行（B5：轨道 / 倍速 / 时间轴菜单统一规格）。
+  Widget _menuIconRow(IconData icon, String label) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 16, color: context.palette.textDim),
+        const SizedBox(width: AppSpacing.sm),
+        Flexible(
+          child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: AppType.body)),
+        ),
+      ],
+    );
+  }
+
+  void _setSpeedMenuOpen(bool open) {
+    if (!mounted) return;
+    if (open) _holdGesture.cancel();
+    setState(() {
+      _speedMenuOpen = open;
+      if (open) _showControls = true;
+    });
+    _startHideTimer();
+  }
+
+  Widget _buildSpeedSelector() {
+    // 覆盖设置中心的默认倍速档位，并提供 2.5× 快捷选项。
+    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
+    return StreamBuilder<double>(
+      stream: widget.playerEngine.rateStream,
+      initialData: widget.playerEngine.rate,
+      builder: (context, snapshot) {
+        final currentRate = snapshot.data ?? 1.0;
+        return FocusOutline(
+          child: Theme(
+            // 底栏文本控件 hover 统一为浅色 12%（默认主题 hover 在深底上不可辨）。
+            data: Theme.of(context).copyWith(
+              hoverColor: _chromeInk.withValues(alpha: 0.12),
+            ),
+            child: PopupMenuButton<double>(
+              key: const ValueKey('player-speed-menu'),
+              tooltip: '播放倍速 (${_shortcutLabel(PlayerShortcutAction.rateUp)}加速 / '
+                  '${_shortcutLabel(PlayerShortcutAction.rateDown)}减速 / '
+                  '${_shortcutLabel(PlayerShortcutAction.rateReset)}重置)',
+              color: context.palette.raised,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(AppRadii.md)),
+              onOpened: () => _setSpeedMenuOpen(true),
+              onCanceled: () => _setSpeedMenuOpen(false),
+              onSelected: (rate) {
+                // 先恢复临时倍速，再提交选择；之后的 key-up 不得覆盖新值。
+                _holdGesture.cancel();
+                if (!_isLiveMode) widget.playerEngine.setRate(rate);
+                _setSpeedMenuOpen(false);
+              },
+              // 倍速入口：36 高统一点击盒，图标与文案共用同一条垂直中线
+              // （不再用上下 padding 凑高度，否则图标会比同行按钮高 7px）。
+              child: SizedBox(
+                height: _controlHitSize,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.speed_rounded, size: 18, color: _chromeInk),
+                      const SizedBox(width: 6),
+                      Text(
+                        '倍速 $currentRate×',
+                        style: const TextStyle(
+                            color: _chromeInk,
+                            fontSize: AppType.body,
+                            fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              itemBuilder: (ctx) {
+                // itemBuilder 先于 onOpened：勾选必须读取恢复后的实际倍速。
+                _holdGesture.cancel();
+                final selectedRate = widget.playerEngine.rate;
+                return speeds
+                    .map((speed) => CheckedPopupMenuItem<double>(
+                          value: speed,
+                          height: 40,
+                          checked: (speed - selectedRate).abs() < 0.001,
+                          child: Text('$speed×',
+                              style: const TextStyle(fontSize: AppType.body)),
+                        ))
+                    .toList();
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 播放器信息（SET-22 / SET-32）：作为设置面板底部的只读行展示，不再占用控制条。
+
+  /// 字幕入口（SET-26 / SET-32）：面板行入口时由 `rowBuilder` 提供行内容。
+  Widget _buildSubtitleSelector({
+    Widget Function(List<TrackInfo> tracks)? rowBuilder,
+    VoidCallback? onSelectionHandled,
+  }) {
+    final nav = widget.subtitleTracksNav;
+    if (nav == null) return const SizedBox.shrink();
+    return StreamBuilder<List<TrackInfo>>(
+      stream: nav.tracksStream,
+      initialData: nav.tracks,
+      builder: (context, snapshot) {
+        final tracks = snapshot.data ?? const <TrackInfo>[];
+        final hasSelected = tracks.any((t) => t.isSelected);
+        final canDisable = nav.onDisable != null;
+        return _buildBottomControlTooltip(
+          message: '字幕（开关 / 轨道）',
+          child: FocusOutline(
+            inset: const EdgeInsets.symmetric(horizontal: 8),
+            child: PopupMenuButton<String>(
+              tooltip: '',
+              color: context.palette.raised,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(AppRadii.md)),
+              onSelected: (value) => unawaited(
+                  _handleSubtitleSelected(value, tracks, nav)
+                      .whenComplete(() => onSelectionHandled?.call())),
+              child: rowBuilder?.call(tracks) ??
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                    child: Icon(Icons.subtitles_rounded,
+                        color: _chromeInk, size: 20),
+                  ),
+              itemBuilder: (ctx) => [
+                if (canDisable)
+                  CheckedPopupMenuItem<String>(
+                    value: 'off',
+                    enabled: nav.readSession == null || nav.readSession!() != null,
+                    height: 40,
+                    checked: !hasSelected,
+                    child: const Text('关闭字幕',
+                        style: TextStyle(fontSize: AppType.body)),
+                  ),
+                if (tracks.isEmpty)
+                  PopupMenuItem<String>(
+                    enabled: false,
+                    height: 40,
+                    child: Text('无可用字幕轨',
+                        style: TextStyle(
+                            fontSize: AppType.caption,
+                            color: ctx.palette.textDim)),
+                  )
+                else
+                  ...tracks.map((t) => CheckedPopupMenuItem<String>(
+                        value: 'sub:${t.id}',
+                        height: 40,
+                        checked: t.isSelected,
+                        child: Tooltip(
+                          message: t.displayName,
+                          excludeFromSemantics: true,
+                          child: _menuIconRow(Icons.subtitles_rounded, t.displayName),
+                        ),
+                      )),
+                ..._subtitleActionItems(nav, onSelectionHandled),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // 动作项在菜单打开时捕获会话，onTap 后只刷新设置，不再走轨道的 onSelected。
+  List<PopupMenuEntry<String>> _subtitleActionItems(
+      PlayerSubtitleTracksNav nav, VoidCallback? onSelectionHandled) {
+    final engine = widget.playerEngine;
+    final session = nav.readSession?.call();
+    bool current() =>
+        mounted &&
+        identical(widget.playerEngine, engine) &&
+        !_usingEmbedded &&
+        session != null &&
+        widget.subtitleTracksNav?.readSession?.call() == session;
+    void handle(Future<void> action) =>
+        unawaited(action.whenComplete(() => onSelectionHandled?.call()));
+    final loadLabel = session == null
+        ? '加载字幕（等待媒体就绪）'
+        : (_loadingLocalSubtitle ? '正在加载字幕…' : '加载本地字幕…');
+    return [
+      if (nav.onLoadLocal != null)
+        PopupMenuItem<String>(
+          height: 40,
+          enabled: session != null && !_loadingLocalSubtitle,
+          onTap: session == null
+              ? null
+              : () => handle(_loadLocalSubtitle(nav, session, current)),
+          child: _menuIconRow(Icons.folder_open_rounded, loadLabel),
+        ),
+      if (nav.onSetScale != null)
+        ...subtitleScaleMenuItems(
+          current: session != null && nav.canScale?.call() == true
+              ? nav.readScale?.call()
+              : null,
+          onSelected: (factor) => handle(_setSubtitleScale(nav, factor, current)),
+        ),
+    ];
+  }
+
+  Future<void> _setSubtitleScale(
+      PlayerSubtitleTracksNav nav, double factor, bool Function() current) async {
+    if (!current()) return;
+    if (nav.canScale?.call() != true) {
+      _osdController.show(Icons.error_outline_rounded, '当前字幕轨不支持调整字号');
+      return;
+    }
+    try {
+      final applied = await nav.onSetScale!(factor);
+      if (applied && current()) {
+        _osdController.show(Icons.format_size, '字幕字号：${(factor * 100).round()}%');
+      }
+    } on UnsupportedError catch (error) {
+      if (current()) {
+        _osdController.show(Icons.error_outline_rounded,
+            error.message ?? '当前字幕轨不支持调整字号');
+      }
+    } catch (_) {
+      if (current()) {
+        _osdController.show(Icons.error_outline_rounded, '调整字幕字号失败');
+      }
+    }
+  }
+
+  Future<void> _loadLocalSubtitle(
+      PlayerSubtitleTracksNav nav, int session, bool Function() current) async {
+    if (_loadingLocalSubtitle || !current()) return;
+    _loadingLocalSubtitle = true;
+    var failure = '无法打开字幕文件选择器';
+    try {
+      final path = await pickLocalSubtitleFile(nav.filePicker);
+      if (path == null || !current()) return;
+      failure = '加载本地字幕失败，请检查文件是否可读';
+      final loaded = await nav.onLoadLocal!(path, session: session);
+      if (loaded && current()) {
+        _osdController.show(Icons.subtitles_rounded, '已加载本地字幕');
+      }
+    } on UnsupportedError catch (error) {
+      if (current()) {
+        _osdController.show(Icons.error_outline_rounded, error.message ?? failure);
+      }
+    } catch (_) {
+      if (current()) {
+        _osdController.show(Icons.error_outline_rounded, failure);
+      }
+    } finally {
+      _loadingLocalSubtitle = false;
+    }
+  }
+
+  /// 音轨入口（SET-27）：轨道勾选。
+  /// 音轨入口（SET-27 / SET-32）：面板行入口时由 `rowBuilder` 提供行内容。
+  Widget _buildAudioSelector({
+    Widget Function(List<TrackInfo> tracks)? rowBuilder,
+    VoidCallback? onSelectionHandled,
+  }) {
+    final nav = widget.audioTracksNav;
+    if (nav == null) return const SizedBox.shrink();
+    return StreamBuilder<List<TrackInfo>>(
+      stream: nav.tracksStream,
+      initialData: nav.tracks,
+      builder: (context, snapshot) {
+        final tracks = snapshot.data ?? const <TrackInfo>[];
+        return _buildBottomControlTooltip(
+          message: '音轨',
+          child: FocusOutline(
+            inset: const EdgeInsets.symmetric(horizontal: 8),
+            child: PopupMenuButton<String>(
+              tooltip: '',
+              color: context.palette.raised,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(AppRadii.md)),
+              onSelected: (value) => unawaited(
+                  _handleAudioSelected(value, tracks, nav)
+                      .whenComplete(() => onSelectionHandled?.call())),
+              child: rowBuilder?.call(tracks) ??
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                    child: Icon(Icons.audiotrack_rounded,
+                        color: _chromeInk, size: 20),
+                  ),
+              itemBuilder: (ctx) => tracks.isEmpty
+                  ? [
+                      PopupMenuItem<String>(
+                        enabled: false,
+                        height: 40,
+                        child: Text('无可用音轨',
+                            style: TextStyle(
+                                fontSize: AppType.caption,
+                                color: ctx.palette.textDim)),
+                      ),
+                    ]
+                  : tracks
+                      .map((t) => CheckedPopupMenuItem<String>(
+                            value: 'audio:${t.id}',
+                            height: 40,
+                            checked: t.isSelected,
+                            child: _menuIconRow(
+                                Icons.audiotrack_rounded, t.displayName),
+                          ))
+                      .toList(),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 视轨入口（SET-28 / SET-32）：面板行入口时由 `rowBuilder` 提供行内容。
+  Widget _buildVideoSelector({
+    Widget Function(List<TrackInfo> tracks, String selectedId)? rowBuilder,
+    VoidCallback? onSelectionHandled,
+  }) {
+    final nav = widget.videoTracksNav;
+    if (nav == null) return const SizedBox.shrink();
+    return StreamBuilder<List<TrackInfo>>(
+      stream: nav.tracksStream,
+      initialData: nav.tracks,
+      builder: (context, snapshot) {
+        final tracks = snapshot.data ?? const <TrackInfo>[];
+        final selectedId = _videoSelectionOverride ??
+            (nav.isDisabled
+                ? 'no'
+                : (tracks.any((t) => t.isSelected)
+                    ? 'video:${tracks.firstWhere((t) => t.isSelected).id}'
+                    : 'auto'));
+        return _buildBottomControlTooltip(
+          message: '视轨',
+          child: FocusOutline(
+            inset: const EdgeInsets.symmetric(horizontal: 8),
+            child: PopupMenuButton<String>(
+              tooltip: '',
+              color: context.palette.raised,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(AppRadii.md)),
+              onSelected: (value) => unawaited(
+                  _handleVideoSelected(value, tracks, nav)
+                      .whenComplete(() => onSelectionHandled?.call())),
+              child: rowBuilder?.call(tracks, selectedId) ??
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                    child: Icon(Icons.video_settings_rounded,
+                        color: _chromeInk, size: 20),
+                  ),
+              itemBuilder: (ctx) => [
+                CheckedPopupMenuItem<String>(
+                  value: 'auto',
+                  height: 40,
+                  checked: selectedId == 'auto',
+                  child: const Text('自动',
+                      style: TextStyle(fontSize: AppType.body)),
+                ),
+                CheckedPopupMenuItem<String>(
+                  value: 'no',
+                  height: 40,
+                  checked: selectedId == 'no',
+                  child: const Text('关闭',
+                      style: TextStyle(fontSize: AppType.body)),
+                ),
+                ...tracks.map((t) => CheckedPopupMenuItem<String>(
+                      value: 'video:${t.id}',
+                      height: 40,
+                      checked: selectedId == 'video:${t.id}',
+                      child: _menuIconRow(
+                          Icons.video_settings_rounded, t.displayName),
+                    )),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 画面比例（SET-30 / SET-32）：面板行入口时由 `rowBuilder` 提供行内容。
+  Widget _buildScaleSelector({
+    Widget Function(String label)? rowBuilder,
+    VoidCallback? onSelectionHandled,
+  }) {
+    if (widget.onScaleChanged == null) return const SizedBox.shrink();
+    const options = PlayerSettings.scaleOptions;
+    final current = widget.scale;
+    final currentLabel = PlayerSettings.labelOf(options, current);
+    return _buildBottomControlTooltip(
+      message: '画面比例（当前：$currentLabel）',
+      child: FocusOutline(
+        inset: const EdgeInsets.symmetric(horizontal: 8),
+        child: PopupMenuButton<String>(
+          tooltip: '',
+          color: context.palette.raised,
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(AppRadii.md)),
+          onSelected: (value) => unawaited(_handleScaleSelected(value)
+              .whenComplete(() => onSelectionHandled?.call())),
+          child: rowBuilder?.call(currentLabel) ??
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                child: Icon(Icons.aspect_ratio_rounded,
+                    color: _chromeInk, size: 20),
+              ),
+          itemBuilder: (ctx) => options
+              .map((o) => CheckedPopupMenuItem<String>(
+                    value: o.value,
+                    height: 40,
+                    checked: o.value == current,
+                    child: Text(o.label,
+                        style: const TextStyle(fontSize: AppType.body)),
+                  ))
+              .toList(),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleSubtitleSelected(
+      String value, List<TrackInfo> tracks, PlayerSubtitleTracksNav nav) async {
+    try {
+      if (value == 'off') {
+        final disable = nav.onDisable;
+        if (disable == null) return;
+        await disable();
+        if (!mounted) return;
+        _osdController.show(Icons.subtitles_off_rounded, '字幕: 已关闭');
+        return;
+      }
+      final track = tracks.firstWhere((t) => 'sub:${t.id}' == value);
+      await nav.onSelect(track);
+      if (!mounted) return;
+      _osdController.show(Icons.subtitles_rounded, '字幕: ${track.displayName}');
+    } on UnsupportedError catch (error) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, error.message ?? '播放器未能启用这条字幕');
+    } catch (_) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, '切换失败，请稍后再试');
+    }
+  }
+
+  Future<void> _handleAudioSelected(
+      String value, List<TrackInfo> tracks, PlayerAudioTracksNav nav) async {
+    try {
+      final track = tracks.firstWhere((t) => 'audio:${t.id}' == value);
+      await nav.onSelect(track);
+      if (!mounted) return;
+      _osdController.show(Icons.audiotrack_rounded, '音轨: ${track.displayName}');
+    } catch (_) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, '切换失败，请稍后再试');
+    }
+  }
+
+  Future<void> _handleVideoSelected(
+      String value, List<TrackInfo> tracks, PlayerVideoTracksNav nav) async {
+    try {
+      final TrackInfo track;
+      if (value == 'auto') {
+        track = const TrackInfo(id: 'auto', type: TrackType.video, title: '自动');
+      } else if (value == 'no') {
+        track = const TrackInfo(id: 'no', type: TrackType.video, title: '关闭');
+      } else {
+        track = tracks.firstWhere((t) => 'video:${t.id}' == value);
+      }
+      await nav.onSelect(track);
+      if (!mounted) return;
+      setState(() => _videoSelectionOverride = value);
+      _osdController.show(
+          Icons.video_settings_rounded, '视轨: ${track.displayName}');
+    } catch (_) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, '切换失败，请稍后再试');
+    }
+  }
+
+  Future<void> _handleScaleSelected(String value) async {
+    final callback = widget.onScaleChanged;
+    if (callback == null) return;
+    try {
+      await callback(value);
+      if (!mounted) return;
+      _osdController.show(
+        Icons.aspect_ratio_rounded,
+        '画面比例: ${PlayerSettings.labelOf(PlayerSettings.scaleOptions, value)}',
+      );
+    } catch (_) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, '画面比例保存失败，请重试');
+    }
+  }
+
+  Future<void> _confirmReset() async {
+    final nav = widget.resetNav;
+    if (nav == null || !nav.enabled) return;
+    final confirmed = await showAppDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('重置播放器数据'),
+        content: const Text('将还原当前影片的片头 / 片尾、播放器设置与画面比例为默认值。此操作不可撤销。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            // 「重置」是破坏性操作，按 destructive-emphasis 用危险色
+            child: Text('重置', style: TextStyle(color: context.palette.danger)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await nav.onReset();
+      if (!mounted) return;
+      _osdController.show(Icons.restart_alt_rounded, '已重置播放器数据');
+    } catch (_) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, '重置失败，请稍后再试');
+    }
+  }
+
+  Widget _buildVolumeControl() {
+    return StreamBuilder<double>(
+      stream: widget.playerEngine.volumeStream,
+      initialData: widget.playerEngine.volume,
+      builder: (context, snapshot) {
+        final vol = snapshot.data ?? 100.0;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _buildBottomControlTooltip(
+              message: '${vol == 0 ? '取消静音' : '静音'} '
+                  '(${_shortcutLabel(PlayerShortcutAction.toggleMute)})',
+              child: _ControlButton(
+                icon: vol == 0
+                    ? Icons.volume_off_rounded
+                    : Icons.volume_up_rounded,
+                onPressed: _handleToggleMute,
+              ),
+            ),
+            // 音量条与静音按钮同一盒高：整行（含滑条）都是 36 高，
+            // 滑条不再把 Row 撑到 44 而让图标中线跟着偏。
+            SizedBox(
+              width: 70,
+              height: _controlHitSize,
+              child: Overlay.wrap(
+                alwaysSizeToContent: true,
+                clipBehavior: Clip.none,
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 2.5,
+                    thumbShape:
+                        const RoundSliderThumbShape(enabledThumbRadius: 4),
+                    activeTrackColor: _chromeInk,
+                    inactiveTrackColor: _chromeTrack,
+                    thumbColor: _chromeInk,
+                  ),
+                  child: Slider(
+                    value: vol.clamp(0.0, 100.0),
+                    max: 100.0,
+                    onChanged: (v) => widget.playerEngine.setVolume(v),
+                    // 拖动过程只改即时音量；松手才上报（§36），避免高频写盘。
+                    onChangeEnd: (v) {
+                      if (v > 0) _lastUnmutedVolume = v;
+                      _commitVolume(v);
+                    },
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// 控制条统一图标按钮（SET-32）：36×36 点击盒、图标居中、圆形 hover 高亮。
+///
+/// 图标中心 = 点击盒中心 = 控制行中线：纯图标入口和「图标 + 文字」入口
+/// 共用同一个 `_controlHitSize` 方盒，行内不会出现「有的偏高 / 有的偏低」。
+/// 收缩尺寸后同一行可容纳更多入口而不溢出；tooltip 由调用方
+/// 用 `_buildBottomControlTooltip` 统一包裹，避免两套定位逻辑。
+class _ControlButton extends StatelessWidget {
+  final IconData icon;
+  final double iconSize;
+  final VoidCallback? onPressed;
+  final bool busy;
+
+  const _ControlButton({
+    super.key,
+    required this.icon,
+    this.iconSize = 20,
+    this.onPressed,
+    this.busy = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onPressed != null;
+    return FocusOutline(
+      radius: AppRadii.pill,
+      // 外层方盒固定 36：`IconButton` 自身的内部盒（含 visualDensity 调整）
+      // 参与不了对齐，图标居中由这个盒子兜底。
+      child: SizedBox.square(
+        dimension: _controlHitSize,
+        child: IconButton(
+          icon: busy
+              // 进度圈本身固定 iconSize 见方（不被拉伸到整个点击盒）。
+              ? Center(
+                  child: SizedBox.square(
+                    dimension: iconSize,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: _chromeInk.withValues(alpha: 0.7),
+                    ),
+                  ),
+                )
+              : Icon(
+                  icon,
+                  size: iconSize,
+                  color:
+                      enabled ? _chromeInk : _chromeInk.withValues(alpha: 0.38),
+                ),
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints.tightFor(
+              width: _controlHitSize, height: _controlHitSize),
+          // standard：compact 会把内部墨迹盒缩到 28，点击区跟着变小、
+          // 图标在 36 盒里偏上 2px（实机「水平高度不符」的一半原因）。
+          visualDensity: VisualDensity.standard,
+          splashRadius: 18,
+          hoverColor: _chromeInk.withValues(alpha: 0.12),
+          onPressed: onPressed,
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,566 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:dio/dio.dart';
+
+import '../bounded_map.dart';
+import '../danmaku/danmaku_matcher.dart' show parseChineseNumber;
+import '../net/http_client_factory.dart';
+import 'detail_lookup_title.dart';
+import 'models/vod_models.dart';
+
+part 'douban_detail_metadata.dart';
+part 'douban_detail_backdrops.dart';
+part 'douban_subject_resolver.dart';
+part 'douban_hot_comments.dart';
+
+/// 豆瓣首页分类（backlog §17）。
+///
+/// [id] 就是豆瓣的 `subject_collection` 标识：分类切换只换集合与缓存键。
+class DoubanCategory {
+  final String id;
+  final String name;
+
+  const DoubanCategory({required this.id, required this.name});
+}
+
+/// 固定 5 类（2026-10-22 逐一实测 200 且有数据）。
+///
+/// 原方案里的 `rank_list_movie` / `rank_list_tv` / `tv_variety` 已 404：
+/// 电影榜改用 `movie_top250`，综艺改用 `show_hot`。口径见台账 §17。
+const List<DoubanCategory> doubanCategories = <DoubanCategory>[
+  DoubanCategory(id: 'movie_hot', name: '热播电影'),
+  DoubanCategory(id: 'tv_hot', name: '热播剧集'),
+  DoubanCategory(id: 'show_hot', name: '热播综艺'),
+  DoubanCategory(id: 'tv_animation', name: '热门动漫'),
+  DoubanCategory(id: 'movie_top250', name: 'Top250'),
+];
+
+const String doubanCinemaMovieCollection = 'movie_showing';
+
+/// 豆瓣条目。
+///
+/// 只承担「导航」：点卡片不会取豆瓣详情，而是拿 [title] 去已启用站源里搜索
+/// （§17 合规口径：不代理播放、不转存豆瓣内容）。
+class DoubanItem {
+  final String id;
+  final String title;
+  final String poster;
+  final String? score;
+  final String? year;
+
+  /// 角标文案：剧集用 `episodes_info`（更新至第 N 集），电影用卡片副标题前两段。
+  final String? subtitle;
+
+  const DoubanItem({
+    required this.id,
+    required this.title,
+    required this.poster,
+    this.score,
+    this.year,
+    this.subtitle,
+  });
+
+  /// 转成首页网格能直接渲染的 [VodItem]（不带 siteKey：豆瓣本身不可请求）。
+  VodItem toVodItem() => VodItem(
+        id: id,
+        name: title,
+        pic: poster,
+        score: score,
+        year: year,
+        remarks: subtitle,
+      );
+}
+
+/// 豆瓣接口失败（网络 / 结构 / 风控统一收敛到这一种错误，便于界面显示重试）。
+class DoubanException implements Exception {
+  final String message;
+
+  const DoubanException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+/// 一页豆瓣内容（§19 无限滚动）。
+///
+/// [total] 来自接口（实测可靠：`movie_showing`=33 / `tv_hot`=240 / `movie_top250`=250），
+/// 用来判断「还有没有下一页」；接口缺失 `total` 时按本页已到末尾处理。
+class DoubanPage {
+  final List<DoubanItem> items;
+  final int total;
+
+  /// 本页的起始偏移（0 基）
+  final int start;
+
+  const DoubanPage({
+    required this.items,
+    required this.total,
+    required this.start,
+  });
+
+  /// 已经加载到的位置，直接作为下一次请求的 `start`
+  int get nextStart => start + items.length;
+
+  /// 空页也视为到底：豆瓣越界请求返回 `total` 但 0 条，不能据此继续翻。
+  bool get hasMore => items.isNotEmpty && nextStart < total;
+}
+
+/// 取回原始响应体；测试注入假实现即可完全离线。
+typedef DoubanHttpGet = Future<String> Function(Uri uri);
+
+/// 豆瓣「热播」数据源（backlog §17）。
+///
+/// 为什么在 Flutter 侧直连、不走 companion：省掉 JVM 冷启，也不依赖载荷里的
+/// Douban 爬虫。接口实测（2026-10-22）：
+/// - `frodo.douban.com/api/v2/...&apiKey=0ac44…`（载荷里那条）→ **400 / 997 已废**；
+/// - `m.douban.com/rexxar/api/v2/subject_collection/<集合>/items` + `Referer: m.douban.com` → 200 可用。
+///
+/// 缓存：内存 8 分钟（豆瓣有频控）+ 同键请求合并（连点分类只发一次），
+/// 失败不写缓存，交给界面「重试」。
+class DoubanRepository {
+  static const String collectionBase =
+      'https://m.douban.com/rexxar/api/v2/subject_collection';
+
+  /// 单片接口前缀（剧照在这里：`<base>/movie/<id>/photos?type=S`）。
+  static const String subjectBase = 'https://m.douban.com/rexxar/api/v2';
+
+  /// 豆瓣接口与图床共用的浏览器 UA。
+  ///
+  /// 图床实测（2026-10-22，Flutter 同款 HttpClient）：**UA + Referer 必须同时带**，
+  /// 只带 Referer 是 403、只带 UA 是 418、都不带 403/418。
+  static const String browserUserAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+
+  /// 豆瓣图床必须的请求头（`img*.doubanio.com` 有防盗链）。
+  static const Map<String, String> imageHeaders = <String, String>{
+    'User-Agent': browserUserAgent,
+    'Referer': 'https://m.douban.com/',
+  };
+
+  /// 逐条判定：只有豆瓣图床才该走 [DoubanPosterImage]（自带 UA + Referer）。
+  ///
+  /// 别的站源图床若收到外来的 `Referer`，有的会直接拒图，所以不能无脑全局加。
+  static bool isDoubanPoster(String pic) {
+    final host = Uri.tryParse(pic)?.host ?? '';
+    if (host.isEmpty) return false;
+    return host == 'douban.com' ||
+        host.endsWith('.douban.com') ||
+        host == 'doubanio.com' ||
+        host.endsWith('.doubanio.com');
+  }
+
+  /// 把豆瓣图床的缩略尺寸段提升到原图：`s/m/l_ratio_poster` → `raw`。
+  ///
+  /// 接口给的多半是 `m_ratio_poster`（约 500px 宽）。横滑轨道用 500px 足够，
+  /// 但首页大屏要把**竖版海报**横向铺满 480 高，500px 会被放大 2–3 倍、糊成
+  /// 一片；`raw` 是上传原图（常见 1000–1500 宽），铺满才够清晰。
+  ///
+  /// 兼容两种携带参数的形式：`?` 查询串与站源常用的 `@Referer=…` 尾巴；
+  /// 只替换路径里的尺寸段，其余原样带回。非豆瓣图床或没有尺寸段时原样返回。
+  static String highResPosterUrl(String url) {
+    if (url.isEmpty || !isDoubanPoster(url)) return url;
+    final at = url.indexOf('@');
+    final head = at == -1 ? url : url.substring(0, at);
+    final tail = at == -1 ? '' : url.substring(at);
+    for (final token in const <String>[
+      's_ratio_poster',
+      'm_ratio_poster',
+      'l_ratio_poster',
+    ]) {
+      if (head.contains(token)) {
+        return '${head.replaceFirst(token, 'raw')}$tail';
+      }
+    }
+    return url;
+  }
+
+  final DoubanHttpGet _httpGet;
+  final _DoubanSubjects _subjects;
+  late final _hotComments = _DoubanHotComments(_subjects);
+  late final _details = _DoubanDetails(_subjects);
+  late final _backdrops = _DoubanBackdrops(_subjects, stillCacheTtl);
+  final Duration cacheTtl;
+
+  /// 剧照（横图）缓存时长：比列表长得多——剧照不随榜单变动，30 分钟足够。
+  final Duration stillCacheTtl;
+
+  /// 键为 `集合:起始:数量`；无限滚动每页一个键，按 [_maxPages] 淘汰最早的页。
+  final Map<String, _CacheEntry> _cache = <String, _CacheEntry>{};
+  static const int _maxPages = 64;
+
+  /// 同一键的并发请求只发一次
+  final Map<String, Future<DoubanPage>> _inflight =
+      <String, Future<DoubanPage>>{};
+
+  /// subject id → 剧照地址（null 表示确认没有横图，避免反复重试）；按 [_maxStills] 淘汰。
+  final Map<String, _OptionalEntry> _stills = <String, _OptionalEntry>{};
+  static const int _maxStills = 128;
+
+  /// 同一部片的剧照请求只发一次（hero 轮播会反复问同一批 id）。
+  final Map<String, Future<String?>> _stillInflight =
+      <String, Future<String?>>{};
+
+  /// subject id → 剧情简介（null 表示确认没有）；与剧照同上限、同时长。
+  final Map<String, _OptionalEntry> _intros = <String, _OptionalEntry>{};
+  final Map<String, Future<String?>> _introInflight =
+      <String, Future<String?>>{};
+
+  DoubanRepository({
+    DoubanHttpGet? httpGet,
+    this.cacheTtl = const Duration(minutes: 8),
+    this.stillCacheTtl = const Duration(minutes: 30),
+  }) : _httpGet = httpGet ?? _dioGet,
+       _subjects = _DoubanSubjects(
+         httpGet == null ? _dioGet : (uri, {cancel}) => httpGet(uri),
+         cacheTtl,
+       );
+
+  Future<List<DoubanComment>> hotCommentsFor(VodItem item, {CancelToken? cancel}) =>
+      _hotComments.forItem(item, cancel);
+
+  /// 仅在核验为同一部影片后返回资料；不请求图库。未匹配或暂不可用返回 null。
+  Future<DoubanDetailMetadata?> detailMetadataFor(VodItem item, {CancelToken? cancel}) =>
+      _details.forItem(item, cancel);
+
+  /// 同片原生横图，海报在剧照之前，最多三张供图片加载失败时依次回退。
+  Future<List<String>> detailBackdropsFor(DoubanDetailMetadata film, {CancelToken? cancel}) =>
+      _backdrops.forFilm(film, cancel);
+
+  /// 一页分类内容：带上 `total` 才能判断「还有没有下一页」（§19 无限滚动）。
+  Future<DoubanPage> fetchPage(
+    String collection, {
+    int start = 0,
+    int count = 18,
+    bool forceRefresh = false,
+  }) {
+    final key = '$collection:$start:$count';
+    final cached = _cache[key];
+    if (!forceRefresh && cached != null && !cached.isExpired) {
+      return Future<DoubanPage>.value(cached.page);
+    }
+    final pending = _inflight[key];
+    if (pending != null) return pending;
+    final future = _fetch(collection, start, count, key);
+    _inflight[key] = future;
+    return future.whenComplete(() => _inflight.remove(key));
+  }
+
+  /// 只取条目（调用方不关心分页信息时用）。
+  Future<List<DoubanItem>> fetchCategory(
+    String collection, {
+    int start = 0,
+    int count = 18,
+    bool forceRefresh = false,
+  }) async =>
+      (await fetchPage(collection,
+              start: start, count: count, forceRefresh: forceRefresh))
+          .items;
+
+  /// 当前内存里是否已有未过期的该分类内容（界面切回时不闪骨架）。
+  bool hasFresh(String collection, {int start = 0, int count = 18}) {
+    final cached = _cache['$collection:$start:$count'];
+    return cached != null && !cached.isExpired;
+  }
+
+  void clearCache() {
+    _hotComments.cache.clear();
+    _subjects.clear();
+    _details.credits.clear();
+    _backdrops.cache.clear();
+    _cache.clear();
+    _stills.clear();
+    _intros.clear();
+  }
+
+  /// 取一部片的**横版剧照**（16:9）；拉不到返回 null，由调用方回落竖版海报。
+  ///
+  /// 为什么不在合集接口里拿：`subject_collection_items` 每条只有一个竖版
+  /// `cover`（实测 4400×5500），在 480 高的巨幅位里只能横切一条再放大，看着糊；
+  /// 剧照接口给的是原生 1600×900 横图（2026-10-23 实测：电影 20/20 横图、
+  /// 剧集 3/20、综艺 10/10）。
+  ///
+  /// 路径固定走 `/movie/`：对剧集 / 综艺 id 它会 301 到 `/tv/`，Dio 默认跟随
+  /// 重定向；真被关掉跟随再退 `/tv/` 试一次。
+  Future<String?> stillUrlFor(String id, {bool forceRefresh = false}) {
+    if (id.isEmpty) return Future<String?>.value(null);
+    final cached = _stills[id];
+    if (!forceRefresh && cached != null && !cached.isExpired) {
+      return Future<String?>.value(cached.value);
+    }
+    final pending = _stillInflight[id];
+    if (pending != null) return pending;
+    final future = _fetchStill(id);
+    _stillInflight[id] = future;
+    return future.whenComplete(() => _stillInflight.remove(id));
+  }
+
+  Future<String?> _fetchStill(String id) async {
+    for (final kind in const <String>['movie', 'tv']) {
+      final uri = Uri.parse('$subjectBase/$kind/$id/photos'
+          '?type=S&start=0&count=20&items_only=1');
+      try {
+        final body = await _httpGet(uri);
+        final url = pickLandscapeStill(body);
+        // 解析成功就落缓存（含 null），免得每次都重打接口。
+        _stills.putBounded(id,
+            _OptionalEntry(url, DateTime.now().add(stillCacheTtl)), _maxStills);
+        return url;
+      } catch (_) {
+        // 该 id 不属于这个类型 / 重定向没被跟随：换下一条路径再试
+      }
+    }
+    return null; // 全失败不缓存，下次进首页再试
+  }
+
+  /// 取一部片的剧情简介（巨幅位用）：豆瓣合集接口不带简介，要问 subject 详情。
+  ///
+  /// 与 [stillUrlFor] 同口径：先 `/movie/`（剧集会 301 到 `/tv/`），不通再退 `/tv/`；
+  /// 解析成功即缓存（含「确认没有」的 null），并发单飞；全失败不缓存。
+  Future<String?> introFor(String id) {
+    if (id.isEmpty) return Future<String?>.value(null);
+    final cached = _intros[id];
+    if (cached != null && !cached.isExpired) {
+      return Future<String?>.value(cached.value);
+    }
+    final pending = _introInflight[id];
+    if (pending != null) return pending;
+    final future = _fetchIntro(id);
+    _introInflight[id] = future;
+    return future.whenComplete(() => _introInflight.remove(id));
+  }
+
+  Future<String?> _fetchIntro(String id) async {
+    for (final kind in const <String>['movie', 'tv']) {
+      try {
+        final body = await _httpGet(Uri.parse('$subjectBase/$kind/$id'));
+        final subject = jsonDecode(body);
+        if (subject is! Map || subject['id'] == null) {
+          throw const FormatException('豆瓣详情响应缺少 subject id');
+        }
+        final intro = pickIntro(body);
+        _intros.putBounded(
+            id,
+            _OptionalEntry(intro, DateTime.now().add(stillCacheTtl)),
+            _maxStills);
+        return intro;
+      } catch (_) {
+        // 该 id 不属于这个类型：换下一条路径再试
+      }
+    }
+    return null;
+  }
+
+  /// 从 subject 详情里取 `intro`：段落换行与全角缩进压成单个空格（巨幅位只排两三行）。
+  static String? pickIntro(String body) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(body);
+    } on FormatException {
+      return null;
+    }
+    if (decoded is! Map) return null;
+    final intro = decoded['intro'];
+    if (intro is! String) return null;
+    final text = intro.replaceAll(RegExp(r'[\s\u3000]+'), ' ').trim();
+    return text.isEmpty ? null : text;
+  }
+
+  /// 从 `photos` 响应里挑一张横图：宽 > 高，取宽度最大者；没有则返回 null。
+  ///
+  /// 剧集剧照里混着竖版（实测 20 张里 17 张竖版），不筛会挑到竖图。
+  static String? pickLandscapeStill(String body) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(body);
+    } on FormatException {
+      return null;
+    }
+    if (decoded is! Map) return null;
+    final photos = decoded['photos'];
+    if (photos is! List) return null;
+    String? best;
+    var bestWidth = 0;
+    for (final entry in photos) {
+      if (entry is! Map) continue;
+      final image = entry['image'];
+      if (image is! Map) continue;
+      final large = image['large'];
+      if (large is! Map) continue;
+      final width = (large['width'] as num?)?.toInt() ?? 0;
+      final height = (large['height'] as num?)?.toInt() ?? 0;
+      final url = (large['url'] ?? '').toString();
+      if (url.isEmpty || width <= height) continue;
+      if (width > bestWidth) {
+        best = url;
+        bestWidth = width;
+      }
+    }
+    return best;
+  }
+
+  Future<DoubanPage> _fetch(
+      String collection, int start, int count, String key) async {
+    final uri = Uri.parse('$collectionBase/$collection/items'
+        '?start=$start&count=$count');
+    final String body;
+    try {
+      body = await _httpGet(uri);
+    } on DoubanException {
+      rethrow;
+    } catch (error) {
+      throw DoubanException('豆瓣接口请求失败：$error');
+    }
+    final page = parsePage(body, start: start);
+    _cache.putBounded(
+        key, _CacheEntry(page, DateTime.now().add(cacheTtl)), _maxPages);
+    return page;
+  }
+
+  /// 解析 rexxar 响应；缺片名或封面的条目跳过（渲染不了，留着只会占位）。
+  static List<DoubanItem> parseItems(String body) =>
+      parsePage(body, start: 0).items;
+
+  /// 解析整页：`total` 缺失时按「本页已到末尾」处理，避免无限请求不存在的页。
+  static DoubanPage parsePage(String body, {int start = 0}) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(body);
+    } on FormatException catch (error) {
+      throw DoubanException('豆瓣接口返回的不是 JSON：${error.message}');
+    }
+    if (decoded is! Map) {
+      throw const DoubanException('豆瓣接口返回结构异常');
+    }
+    final raw = decoded['subject_collection_items'];
+    if (raw is! List) {
+      throw const DoubanException('豆瓣接口未返回条目列表');
+    }
+    final items = <DoubanItem>[];
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final item = parseItem(entry);
+      if (item != null) items.add(item);
+    }
+    return DoubanPage(
+      items: List<DoubanItem>.unmodifiable(items),
+      total: (decoded['total'] as num?)?.toInt() ?? start + items.length,
+      start: start,
+    );
+  }
+
+  /// 单条解析：`movie_*` 用 `cover.url`，`tv_*` / `show_hot` 用 `pic.large`。
+  static DoubanItem? parseItem(Map<dynamic, dynamic> raw) {
+    final title = (raw['title'] ?? '').toString().trim();
+    if (title.isEmpty) return null;
+    final poster = _posterOf(raw);
+    if (poster.isEmpty) return null;
+    return DoubanItem(
+      id: (raw['id'] ?? title).toString(),
+      title: title,
+      poster: poster,
+      score: _scoreOf(raw),
+      year: _nonEmpty(raw['year']),
+      subtitle: _subtitleOf(raw),
+    );
+  }
+
+  static String _posterOf(Map<dynamic, dynamic> raw) {
+    final cover = raw['cover'];
+    if (cover is Map) {
+      final url = (cover['url'] ?? '').toString();
+      if (url.isNotEmpty) return url;
+    }
+    final pic = raw['pic'];
+    if (pic is Map) {
+      for (final size in const <String>['large', 'normal', 'small']) {
+        final url = (pic[size] ?? '').toString();
+        if (url.isNotEmpty) return url;
+      }
+    }
+    return '';
+  }
+
+  static String? _scoreOf(Map<dynamic, dynamic> raw) {
+    final rating = raw['rating'];
+    if (rating is! Map) return null;
+    final value = rating['value'];
+    if (value is! num || value <= 0) return null;
+    return value.toStringAsFixed(1);
+  }
+
+  static String? _subtitleOf(Map<dynamic, dynamic> raw) {
+    final episodes = _nonEmpty(raw['episodes_info']);
+    if (episodes != null) return episodes;
+    final card = _nonEmpty(raw['card_subtitle']);
+    if (card == null) return null;
+    // 形如「2026 / 中国大陆 / 剧情 …」：只取前两段，角标不至于长到溢出
+    final parts = card
+        .split('/')
+        .map((part) => part.trim())
+        .where((part) => part.isNotEmpty)
+        .take(2)
+        .join(' / ');
+    return parts.isEmpty ? null : parts;
+  }
+
+  static String? _nonEmpty(Object? value) {
+    final text = value?.toString().trim() ?? '';
+    return text.isEmpty ? null : text;
+  }
+
+  /// 点片搜索使用的关键词：把「第二季」「(2024)」「【】」这类噪声去掉。
+  ///
+  /// 豆瓣标题常带季数 / 年份，原样丢给站源搜索命中率会掉；归一后为空则退回原片名。
+  static String searchKeyword(String title) {
+    var value = title.trim();
+    value = value.replaceAll('（', '(').replaceAll('）', ')');
+    value = value.replaceAll(RegExp(r'[\(\[【][^\)\]】]*[\)\]】]'), ' ');
+    value = value.replaceAll(RegExp(r'第[一二三四五六七八九十百0-9]+季'), ' ');
+    value = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return value.isEmpty ? title.trim() : value;
+  }
+
+  static final Dio _sharedDio = HttpClientFactory.createDio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 10),
+      receiveTimeout: const Duration(seconds: 15),
+      responseType: ResponseType.plain,
+      headers: const <String, String>{
+        'User-Agent': browserUserAgent,
+        'Referer': 'https://m.douban.com/',
+        'Accept': 'application/json, text/plain, */*',
+      },
+      validateStatus: (code) => code != null && code >= 200 && code < 300,
+    ),
+  );
+
+  static Future<String> _dioGet(Uri uri, {CancelToken? cancel}) async {
+    final response = await _sharedDio.getUri<String>(uri, cancelToken: cancel);
+    final body = response.data;
+    if (body == null || body.isEmpty) {
+      throw const DoubanException('豆瓣接口返回空响应');
+    }
+    return body;
+  }
+}
+
+/// 剧照 / 简介缓存条目：`value == null` 也缓存，表示「确认没有」（横图 / 简介）。
+class _OptionalEntry {
+  final String? value;
+  final DateTime expiresAt;
+
+  const _OptionalEntry(this.value, this.expiresAt);
+
+  bool get isExpired => DateTime.now().isAfter(expiresAt);
+}
+
+class _CacheEntry {
+  final DoubanPage page;
+  final DateTime expiresAt;
+
+  const _CacheEntry(this.page, this.expiresAt);
+
+  bool get isExpired => DateTime.now().isAfter(expiresAt);
+}

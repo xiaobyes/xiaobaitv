@@ -1,0 +1,168 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
+import '../net/http_client_factory.dart';
+import 'spider_ui_models.dart';
+
+/// 载荷界面通道：companion 就绪后持续长轮询 `/ui/events`，把弹窗 / Toast 等事件广播给界面层；
+/// 界面层通过 [send] 把用户操作回放给载荷。
+///
+/// 生命周期跟随 [readyPort]：端口变化（重启）时从头同步（cursor = -1，服务端返回当前弹窗全集）；
+/// 端口变为 null（停止 / 退出）时广播一次空的 [SpiderUiReset]，让界面关掉所有残留弹窗。
+/// 长轮询本身不计为「使用」，不会阻止 companion 空闲停用；只有用户操作才调用 [onActivity]。
+class CompanionUiChannel {
+  final ValueListenable<int?> readyPort;
+  final Dio _dio;
+  final bool _ownsDio;
+  final Duration pollWait;
+  final Duration retryDelay;
+  final void Function()? onActivity;
+
+  final StreamController<SpiderUiEvent> _events =
+      StreamController<SpiderUiEvent>.broadcast();
+  int? _port;
+  int _generation = 0;
+  bool _started = false;
+  bool _disposed = false;
+  DateTime? _lastDialogShownAt;
+  DateTime? _lastToastAt;
+  final Set<int> _openDialogs = {};
+
+  CompanionUiChannel({
+    required this.readyPort,
+    Dio? dio,
+    this.pollWait = const Duration(seconds: 25),
+    this.retryDelay = const Duration(seconds: 1),
+    this.onActivity,
+  })  : _ownsDio = dio == null,
+        _dio = dio ??
+            HttpClientFactory.createDio(BaseOptions(
+              connectTimeout: const Duration(seconds: 5),
+              sendTimeout: const Duration(seconds: 5),
+            ));
+
+  Stream<SpiderUiEvent> get events => _events.stream;
+
+  /// 最近一次有新弹窗出现的时间（用于判断「这次点击已经由载荷弹窗接管」）。
+  DateTime? get lastDialogShownAt => _lastDialogShownAt;
+
+  /// 最近一次载荷 Toast 的时间（设置类条目常只回一条提示，不弹窗）。
+  DateTime? get lastToastAt => _lastToastAt;
+
+  /// 载荷侧仍打开的弹窗数；归零即用户已处理完本轮登录 / 设置弹窗。
+  int get openDialogCount => _openDialogs.length;
+
+  void start() {
+    if (_started || _disposed) return;
+    _started = true;
+    readyPort.addListener(_onPortChanged);
+    _onPortChanged();
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _generation++;
+    if (_started) readyPort.removeListener(_onPortChanged);
+    unawaited(_events.close());
+    // 长轮询单次最长挂 pollWait（默认 25s）：自建的 Dio 在释放时强制关闭，
+    // 立刻断开在途请求与连接池，不留到超时（2026-10-28 发布前资源审查）。
+    if (_ownsDio) _dio.close(force: true);
+  }
+
+  void _onPortChanged() {
+    final port = readyPort.value;
+    if (port == _port) return;
+    final hadPort = _port != null;
+    _port = port;
+    final generation = ++_generation;
+    if (port == null) {
+      if (hadPort) _emit(const SpiderUiReset([]));
+      return;
+    }
+    unawaited(_pollLoop(port, generation));
+  }
+
+  bool _alive(int generation) => !_disposed && generation == _generation;
+
+  Future<void> _pollLoop(int port, int generation) async {
+    var cursor = -1;
+    while (_alive(generation)) {
+      try {
+        final res = await _dio.get<dynamic>(
+          'http://127.0.0.1:$port/ui/events',
+          queryParameters: {'after': cursor, 'wait': pollWait.inMilliseconds},
+          options:
+              Options(receiveTimeout: pollWait + const Duration(seconds: 10)),
+        );
+        if (!_alive(generation)) return;
+        final raw =
+            res.data is String ? jsonDecode(res.data as String) : res.data;
+        final result = SpiderUiPollResult.tryParse(raw);
+        if (result == null) {
+          throw const FormatException('invalid /ui/events response');
+        }
+        cursor = result.cursor;
+        for (final event in result.events) {
+          _emit(event);
+        }
+      } catch (_) {
+        if (!_alive(generation)) return;
+        // 服务刚就绪 / 短暂不可达：稍后重试；进程真的退出时 readyPort 会变为 null 终止本循环
+        await Future<void>.delayed(retryDelay);
+      }
+    }
+  }
+
+  void _emit(SpiderUiEvent event) {
+    if (_disposed) return;
+    switch (event) {
+      case SpiderDialogShown(:final dialog, :final isUpdate):
+        if (!isUpdate) _lastDialogShownAt = DateTime.now();
+        _openDialogs.add(dialog.id);
+      case SpiderUiReset(:final dialogs):
+        if (dialogs.isNotEmpty) _lastDialogShownAt = DateTime.now();
+        _openDialogs
+          ..clear()
+          ..addAll(dialogs.map((d) => d.id));
+      case SpiderDialogDismissed(:final id):
+        _openDialogs.remove(id);
+      case SpiderToast():
+        _lastToastAt = DateTime.now();
+      default:
+        break;
+    }
+    _events.add(event);
+  }
+
+  /// 回放一次用户操作；返回 false 表示服务不可达或该弹窗已不存在（界面应自行关闭它）。
+  Future<bool> send(SpiderUiInput input) async {
+    final port = _port;
+    if (port == null || _disposed) return false;
+    onActivity?.call();
+    try {
+      final res = await _dio.post<dynamic>(
+        'http://127.0.0.1:$port/ui/input',
+        data: input.toJson(),
+        options: Options(receiveTimeout: const Duration(seconds: 10)),
+      );
+      final raw =
+          res.data is String ? jsonDecode(res.data as String) : res.data;
+      final accepted = raw is Map && raw['accepted'] == true;
+      if (!accepted) {
+        // 载荷已不认这个弹窗，之后也不会再发 dismiss：本地按已关闭处理
+        _openDialogs.remove(input.dialogId);
+        debugPrint(
+            '[spider-ui] 操作未被接受：dialog=${input.dialogId} type=${input.type}');
+      }
+      return accepted;
+    } catch (e) {
+      debugPrint('[spider-ui] 操作发送失败：dialog=${input.dialogId} '
+          'type=${input.type} error=${e.runtimeType}');
+      return false;
+    }
+  }
+}

@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import '../../../core/api/models/vod_models.dart';
-import '../../theme/app_icon_assets.dart';
 import '../../theme/app_palette.dart';
 import '../../theme/app_tokens.dart';
 import '../catalog/poster_image.dart';
@@ -122,9 +121,6 @@ class NetflixHomeView extends StatefulWidget {
 }
 
 class _NetflixHomeViewState extends State<NetflixHomeView> {
-  /// 参考图顶部导航当前项（0 = 首页）。
-  int _navIndex = 0;
-
   /// 外部没给控制器时才自己建一个（自建才由自己释放）。
   ScrollController? _ownScrollController;
 
@@ -135,24 +131,6 @@ class _NetflixHomeViewState extends State<NetflixHomeView> {
   void dispose() {
     _ownScrollController?.dispose();
     super.dispose();
-  }
-
-  /// 提取用于大屏轮播的影片列表（从热播电影或首个有数据的分类中取前 6 部）
-  List<VodItem> _extractBillboardItems() {
-    final ranked = widget.billboardItems;
-    if (ranked != null) {
-      final seen = <String>{};
-      return ranked.where((item) => seen.add(item.id)).take(10).toList();
-    }
-    if (widget.categoryItemsMap.isEmpty) return const [];
-    // 优先从首个分类或热播中取
-    for (final cat in widget.categories) {
-      final list = widget.categoryItemsMap[cat.id];
-      if (list != null && list.isNotEmpty) {
-        return list.take(6).toList();
-      }
-    }
-    return const [];
   }
 
   @override
@@ -193,10 +171,6 @@ class _NetflixHomeViewState extends State<NetflixHomeView> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _buildNav(palette),
-              const SizedBox(height: 12),
-              _buildTools(palette),
-              const SizedBox(height: 26),
               _buildRow('热门推荐', hot, palette),
               const SizedBox(height: 26),
               _buildRow('最新上线', fresh, palette),
@@ -227,145 +201,6 @@ class _NetflixHomeViewState extends State<NetflixHomeView> {
     return out;
   }
 
-  Widget _buildNav(AppPalette palette) {
-    const labels = [
-      '首页',
-      '电影',
-      '剧集',
-      '综艺',
-      '电影筛选',
-      '剧集筛选',
-      '电影榜',
-      '剧集榜'
-    ];
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(36, 10, 36, 10),
-      child: Row(
-        children: [
-          // 2.1.x 顶栏：只有圆角应用图标，没有文字字标
-          Container(
-            width: 50,
-            height: 50,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(13),
-              boxShadow: const [
-                BoxShadow(
-                    color: Color(0x73000000),
-                    blurRadius: 18,
-                    offset: Offset(0, 6)),
-              ],
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(13),
-              child: Image.asset(appIconAsset,
-                  width: 50,
-                  height: 50,
-                  filterQuality: FilterQuality.high,
-                  excludeFromSemantics: true),
-            ),
-          ),
-          const SizedBox(width: 22),
-          Expanded(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  for (var i = 0; i < labels.length; i++)
-                    _navTab(labels[i], i == _navIndex, i, palette),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(width: 16),
-          _NavStatus(
-            palette: palette,
-            siteName: widget.siteName,
-            onSiteTap: widget.onSiteTap,
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 2.1.x 页签：23px 文字 + 选中时下方 4px 强调色横条。
-  Widget _navTab(String label, bool active, int index, AppPalette palette) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () {
-        setState(() => _navIndex = index);
-        widget.onNavTap?.call(index);
-      },
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 11),
-          child: Stack(
-            children: [
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    fontSize: 23,
-                    fontWeight: active ? FontWeight.w800 : FontWeight.w500,
-                    color: active ? palette.textTitle : palette.textSub,
-                    height: 1.05,
-                  ),
-                ),
-              ),
-              if (active)
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  child: Container(
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: palette.accentInk,
-                      borderRadius: BorderRadius.circular(3),
-                      boxShadow: [
-                        BoxShadow(
-                            color: palette.accentInk.withOpacity(0.55),
-                            blurRadius: 14),
-                      ],
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildTools(AppPalette palette) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 36),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            _tool(Icons.history_rounded, '历史', widget.onHistoryTap, palette),
-            _tool(Icons.live_tv_rounded, '直播', widget.onLiveTap, palette),
-            _tool(Icons.search_rounded, '搜索', widget.onSearchTap, palette),
-            _tool(Icons.settings_outlined, '配置', widget.onConfigTap, palette),
-            _tool(Icons.swap_horiz_rounded, '线路', widget.onLineTap, palette),
-            _tool(Icons.favorite_border_rounded, '收藏', widget.onFavTap, palette),
-            _tool(Icons.image_rounded, '壁纸', widget.onWallpaperTap, palette),
-            _tool(Icons.brightness_4_rounded, '明暗', widget.onThemeTap, palette),
-            _tool(Icons.menu_rounded, '设置', widget.onSettingsTap, palette),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 2.1.x 功能入口方块：126×86、16px 圆角、图标在上文字在下，悬停上浮描边。
-  Widget _tool(
-      IconData icon, String label, VoidCallback? onTap, AppPalette palette) {
-    return _QuickToolTile(
-        icon: icon, label: label, onTap: onTap, palette: palette);
-  }
 
   Widget _buildRow(String title, List<VodItem> items, AppPalette palette) {
     return Padding(
@@ -1821,201 +1656,5 @@ class _NetflixRowCardState extends State<_NetflixRowCard> {
   }
 }
 
-/// 2.1.3 顶栏右侧：站源切换（原信号格位置）+ 时钟。
-class _NavStatus extends StatefulWidget {
-  final AppPalette palette;
 
-  /// 当前站源名；null 时显示「选择站源」。
-  final String? siteName;
-  final VoidCallback? onSiteTap;
 
-  const _NavStatus({
-    required this.palette,
-    this.siteName,
-    this.onSiteTap,
-  });
-
-  @override
-  State<_NavStatus> createState() => _NavStatusState();
-}
-
-class _NavStatusState extends State<_NavStatus> {
-  Timer? _timer;
-  DateTime _now = DateTime.now();
-
-  @override
-  void initState() {
-    super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 20), (_) {
-      if (mounted) setState(() => _now = DateTime.now());
-    });
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = widget.palette;
-    final hh = _now.hour.toString().padLeft(2, '0');
-    final mm = _now.minute.toString().padLeft(2, '0');
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // 站源切换：点击弹出站源列表（从标题栏挪到这里，替换原信号格）。
-        _SiteSwitchPill(
-          palette: palette,
-          siteName: widget.siteName,
-          onTap: widget.onSiteTap,
-        ),
-        const SizedBox(width: 14),
-        Text('$hh:$mm',
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.w700,
-              color: palette.textTitle,
-            )),
-      ],
-    );
-  }
-}
-
-/// 顶栏里的站源胶囊：`⟳ 豆瓣热播`，窄窗口时名字省略。
-class _SiteSwitchPill extends StatefulWidget {
-  final AppPalette palette;
-  final String? siteName;
-  final VoidCallback? onTap;
-
-  const _SiteSwitchPill({
-    required this.palette,
-    this.siteName,
-    this.onTap,
-  });
-
-  @override
-  State<_SiteSwitchPill> createState() => _SiteSwitchPillState();
-}
-
-class _SiteSwitchPillState extends State<_SiteSwitchPill> {
-  bool _hover = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = widget.palette;
-    final name = (widget.siteName?.trim().isEmpty ?? true)
-        ? '选择站源'
-        : widget.siteName!.trim();
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _hover = true),
-      onExit: (_) => setState(() => _hover = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          constraints: const BoxConstraints(maxWidth: 190),
-          padding: const EdgeInsets.fromLTRB(12, 7, 12, 7),
-          decoration: BoxDecoration(
-            color: _hover
-                ? palette.accentInk.withOpacity(0.20)
-                : palette.raised.withOpacity(0.72),
-            borderRadius: BorderRadius.circular(9),
-            border: Border.all(
-              color: _hover
-                  ? palette.accentInk
-                  : palette.border.withOpacity(0.9),
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.swap_horiz_rounded,
-                  size: 16, color: palette.accentInk),
-              const SizedBox(width: 6),
-              Flexible(
-                child: Text(
-                  name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                    color: palette.textTitle,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// 2.1.x 功能入口方块：126x86、16px 圆角，悬停上浮并切换描边。
-class _QuickToolTile extends StatefulWidget {
-  final IconData icon;
-  final String label;
-  final VoidCallback? onTap;
-  final AppPalette palette;
-
-  const _QuickToolTile({
-    required this.icon,
-    required this.label,
-    required this.palette,
-    this.onTap,
-  });
-
-  @override
-  State<_QuickToolTile> createState() => _QuickToolTileState();
-}
-
-class _QuickToolTileState extends State<_QuickToolTile> {
-  bool _hover = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = widget.palette;
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _hover = true),
-      onExit: (_) => setState(() => _hover = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          width: 126,
-          height: 86,
-          margin: const EdgeInsets.only(right: 16),
-          transform: Matrix4.translationValues(0, _hover ? -3 : 0, 0),
-          decoration: BoxDecoration(
-            // 统一透度：与顶栏同为 panel 30%，悬停才提一点。
-            color: _hover
-                ? palette.panel.withValues(alpha: 0.45)
-                : palette.panel.withValues(alpha: 0.30),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-                color: _hover ? palette.accentInk : palette.border),
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(widget.icon, size: 26, color: palette.accentInk),
-              const SizedBox(height: 7),
-              Text(widget.label,
-                  style: TextStyle(
-                    fontSize: 17,
-                    color: _hover ? palette.textTitle : palette.textBody,
-                    height: 1.0,
-                  )),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}

@@ -1,5 +1,3 @@
-import 'dart:ui' show ImageFilter;
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -70,79 +68,97 @@ class _HomeSearchPageState extends State<HomeSearchPage> {
   @override
   Widget build(BuildContext context) {
     final palette = AppPalette.of(context);
-    final light = Theme.of(context).brightness == Brightness.light;
 
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        // 遮罩：点空白退出
-        GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: widget.onClose,
-          child: ColoredBox(
-            color: light
-                ? Colors.black.withValues(alpha: 0.35)
-                : Colors.black.withValues(alpha: 0.55),
+    return Shortcuts(
+      shortcuts: const {
+        SingleActivator(LogicalKeyboardKey.escape): _CloseSearchIntent(),
+      },
+      child: Actions(
+        actions: {
+          _CloseSearchIntent: CallbackAction<_CloseSearchIntent>(
+            onInvoke: (_) {
+              widget.onClose();
+              return null;
+            },
           ),
-        ),
-        ClipRect(
-          child: BackdropFilter(
-            filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-            child: ColoredBox(
-              color: palette.background.withValues(alpha: 0.30),
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: widget.onClose,
-                child: Shortcuts(
-                  shortcuts: const {
-                    SingleActivator(LogicalKeyboardKey.escape):
-                        _CloseSearchIntent(),
-                  },
-                  child: Actions(
-                    actions: {
-                      _CloseSearchIntent: CallbackAction<_CloseSearchIntent>(
-                        onInvoke: (_) {
-                          widget.onClose();
-                          return null;
-                        },
-                      ),
-                    },
-                    child: Align(
-                      alignment: const Alignment(0, -0.25),
-                      child: GestureDetector(
-                        // 面板自身不触发关闭
-                        onTap: () {},
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 760),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _searchField(palette),
-                              const SizedBox(height: 22),
-                              _hotWords(palette),
-                            ],
-                          ),
+        },
+        child: Dialog(
+          backgroundColor: palette.panel,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadii.lg),
+            side: BorderSide(color: palette.border, width: 1),
+          ),
+          child: Container(
+            width: 780,
+            height: 580,
+            decoration: BoxDecoration(
+              color: palette.panel,
+              borderRadius: BorderRadius.circular(AppRadii.lg),
+            ),
+            padding: const EdgeInsets.all(22),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: palette.accentWash,
+                        borderRadius: BorderRadius.circular(AppRadii.sm),
+                        border: Border.all(
+                          color: palette.accentInk.withValues(alpha: 0.3),
+                          width: 0.8,
                         ),
                       ),
+                      child: Icon(Icons.search_rounded,
+                          color: palette.accentInk, size: 20),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('搜索',
+                              style: TextStyle(
+                                fontSize: AppType.h2,
+                                fontWeight: FontWeight.bold,
+                                color: palette.textTitle,
+                              )),
+                          Text('电影、剧集、综艺、演员…',
+                              style: TextStyle(
+                                fontSize: AppType.caption,
+                                color: palette.textSub,
+                              )),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '关闭搜索',
+                      onPressed: widget.onClose,
+                      icon: Icon(Icons.close_rounded,
+                          size: 22, color: palette.textSub),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+                Expanded(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _searchField(palette),
+                        const SizedBox(height: 22),
+                        _hotWords(palette),
+                      ],
                     ),
                   ),
                 ),
-              ),
+              ],
             ),
           ),
         ),
-        // 右上角关闭
-        Positioned(
-          top: 18,
-          right: 18,
-          child: IconButton(
-            tooltip: '关闭搜索',
-            onPressed: widget.onClose,
-            icon: Icon(Icons.close_rounded, size: 22, color: palette.textSub),
-          ),
-        ),
-      ],
+      ),
     );
   }
 

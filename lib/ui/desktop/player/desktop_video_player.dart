@@ -417,6 +417,10 @@ class DesktopVideoPlayer extends StatefulWidget {
   /// [LiveChannelLayer]（控制条之下）——返回 / 播放 / 时间轴不被遮挡。
   final List<Live>? liveChannels;
 
+  /// 是否处于直播播放页：频道尚未加载完成时，左侧栏也先展开空态占位，
+  /// 不等到频道列表到达；非直播（影视）播放页为 false，不挂抽屉层。
+  final bool isLive;
+
   /// 当前频道在 [liveChannels] 中的下标（抽屉高亮 / 滚动定位）。
   final int liveCurrentIndex;
 
@@ -519,6 +523,7 @@ class DesktopVideoPlayer extends StatefulWidget {
     this.onLivePrev,
     this.onLiveNext,
     this.liveChannels,
+    this.isLive = false,
     this.liveCurrentIndex = 0,
     this.liveFavoriteKeys = const {},
     this.onLiveSelect,
@@ -692,6 +697,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     super.initState();
     widget.windowManager.isPipNotifier.addListener(_onPipChanged);
     widget.windowManager.isImmersiveNotifier.addListener(_onImmersiveChanged);
+    widget.windowManager.isFullScreenNotifier.addListener(_onFullScreenChanged);
     _immersive = widget.windowManager.isImmersiveNotifier.value;
     _syncImmersive(widget.hideWindowTitleBar);
     _bottomBarFocusNode.addListener(_onBottomBarFocusChanged);
@@ -839,6 +845,8 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     widget.windowManager.isPipNotifier.removeListener(_onPipChanged);
     widget.windowManager.isImmersiveNotifier
         .removeListener(_onImmersiveChanged);
+    widget.windowManager.isFullScreenNotifier
+        .removeListener(_onFullScreenChanged);
     _bottomBarFocusNode.removeListener(_onBottomBarFocusChanged);
     _bottomBarFocusNode.dispose();
     _focusNode.dispose();
@@ -973,6 +981,11 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     final immersive = widget.windowManager.isImmersiveNotifier.value;
     if (immersive == _immersive) return;
     if (mounted) setState(() => _immersive = immersive);
+  }
+
+  /// 全屏切换 → 重建：进全屏隐藏左侧边栏，退出全屏按原开合状态恢复。
+  void _onFullScreenChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onBottomBarFocusChanged() {
@@ -1309,9 +1322,10 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
   /// 频道抽屉置于控制栏之上；错误时热区避开工具栏，仍可选择其他频道。
   Widget _wrapLiveLayer(Widget player) {
     final channels = widget.liveChannels;
-    if (channels == null || channels.isEmpty) return player;
+    // 非直播（影视）页不挂抽屉层；直播页即便频道尚未加载也展开空态。
+    if (!widget.isLive) return player;
     return LiveChannelLayer(
-      channels: channels,
+      channels: channels ?? const [],
       currentIndex: widget.liveCurrentIndex,
       enabled: !widget.windowManager.isPipNotifier.value && !_lineMenuOpen,
       canOpen: !_chromeVisible || _hasPlaybackError,
@@ -1324,6 +1338,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
       onSelect: widget.onLiveSelect ?? (_) {},
       onManage: widget.onLiveManage ?? () {},
       sourceNav: widget.liveSourceNav,
+      fullScreenHidden: widget.windowManager.isFullScreenNotifier.value,
       child: player,
     );
   }

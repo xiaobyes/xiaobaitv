@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
 import '../window/desktop_window_manager.dart';
-import '../../theme/app_icon_assets.dart';
 import '../../theme/app_palette.dart';
 import 'focus_ring.dart';
 import '../../theme/app_tokens.dart';
-import 'site_source_icon.dart';
 
 /// 标题栏高度：DesktopWindowFrame 顶部栏实高（窗口控制按钮与全局消息浮层定位共用）。
 const double kDesktopTitleBarHeight = 44;
@@ -261,88 +259,12 @@ class _TitleBarIconButtonState extends State<_TitleBarIconButton> {
   }
 }
 
-/// 首页站源胶囊按钮（直接显示站源名称）
-class _SiteSourcePill extends StatefulWidget {
-  final String siteName;
-  final String? iconUrl;
-  final Map<String, String>? headers;
-  final VoidCallback? onTap;
-
-  const _SiteSourcePill({
-    required this.siteName,
-    this.iconUrl,
-    this.headers,
-    this.onTap,
-  });
-
-  @override
-  State<_SiteSourcePill> createState() => _SiteSourcePillState();
-}
-
-class _SiteSourcePillState extends State<_SiteSourcePill> {
-  bool _isHovered = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = AppPalette.of(context);
-    return MouseRegion(
-      onEnter: (_) => setState(() => _isHovered = true),
-      onExit: (_) => setState(() => _isHovered = false),
-      cursor: widget.onTap != null
-          ? SystemMouseCursors.click
-          : SystemMouseCursors.basic,
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: AnimatedContainer(
-          duration: Duration.zero,
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4.5),
-          decoration: BoxDecoration(
-            color: _isHovered ? palette.hover : palette.raised,
-            borderRadius: BorderRadius.circular(AppRadii.sm),
-            border: Border.all(
-              color: _isHovered ? palette.accentInk : palette.borderStrong,
-              width: 1,
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SiteSourceIcon(iconUrl: widget.iconUrl, headers: widget.headers),
-              const SizedBox(width: 6),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 160),
-                child: Text(
-                  widget.siteName,
-                  style: TextStyle(
-                    fontSize: AppType.caption,
-                    fontWeight: FontWeight.w600,
-                    color: _isHovered ? palette.textTitle : palette.textBody,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              const SizedBox(width: 4),
-              Icon(
-                Icons.arrow_drop_down_rounded,
-                size: 16,
-                color: _isHovered ? palette.accentInk : palette.textSub,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 /// 统一 Windows 按钮悬浮样式组件
 class _WindowButton extends StatefulWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback onPressed;
   final bool isCloseButton;
-  final Color? iconColor;
   final FocusNode? focusNode;
 
   const _WindowButton({
@@ -350,7 +272,6 @@ class _WindowButton extends StatefulWidget {
     required this.tooltip,
     required this.onPressed,
     this.isCloseButton = false,
-    this.iconColor,
     this.focusNode,
   });
 
@@ -365,7 +286,7 @@ class _WindowButtonState extends State<_WindowButton> {
   Widget build(BuildContext context) {
     final palette = AppPalette.of(context);
     Color backgroundColor = Colors.transparent;
-    Color iconColor = widget.iconColor ?? palette.textBody;
+    Color iconColor = palette.textBody;
 
     if (_isHovered) {
       if (widget.isCloseButton) {

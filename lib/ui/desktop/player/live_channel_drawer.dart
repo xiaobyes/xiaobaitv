@@ -51,6 +51,9 @@ class LiveChannelLayer extends StatefulWidget {
   /// 抽屉头部的「直播源」下拉；null 时不显示。
   final LiveSourceNav? sourceNav;
 
+  /// 全屏时临时隐藏左侧边栏（不改动用户的开合偏好；退出全屏后按原状态恢复）。
+  final bool fullScreenHidden;
+
   const LiveChannelLayer({
     super.key,
     required this.channels,
@@ -66,6 +69,7 @@ class LiveChannelLayer extends StatefulWidget {
     this.onOpenChanged,
     this.initiallyOpen = false,
     this.sourceNav,
+    this.fullScreenHidden = false,
   });
 
   @override
@@ -75,16 +79,11 @@ class LiveChannelLayer extends StatefulWidget {
 class _LiveChannelLayerState extends State<LiveChannelLayer> {
   static const double _drawerMaxWidth = 380;
   static const double _drawerMaxRatio = 0.7;
-  static const double _hotzoneMax = 220;
-  static const double _hotzoneRatio = 0.16;
+  static const double _collapsedWidth = 46;
 
-  late bool _open =
-      widget.initiallyOpen && widget.enabled && widget.channels.isNotEmpty;
+  /// 进入直播即展开：不再要求频道列表已加载完成（加载中先展开空态）。
+  late bool _open = widget.initiallyOpen && widget.enabled;
   double _layoutWidth = 0;
-
-  double get _hotzoneWidth => _layoutWidth == 0
-      ? _hotzoneMax
-      : math.min(_layoutWidth * _hotzoneRatio, _hotzoneMax);
 
   double get _drawerWidth => _layoutWidth == 0
       ? _drawerMaxWidth
@@ -106,9 +105,6 @@ class _LiveChannelLayerState extends State<LiveChannelLayer> {
   void didUpdateWidget(covariant LiveChannelLayer oldWidget) {
     super.didUpdateWidget(oldWidget);
     final wasOpen = _open;
-    if (widget.channels.isEmpty && _open) {
-      _open = false;
-    }
     // §35：进画中画时立刻收起，避免抽屉留在小窗里。
     if (!widget.enabled && _open) {
       _open = false;
@@ -121,8 +117,7 @@ class _LiveChannelLayerState extends State<LiveChannelLayer> {
   }
 
   void _openDrawer() {
-    if (!_open && widget.canOpen && widget.enabled &&
-        widget.channels.isNotEmpty) {
+    if (!_open && widget.enabled && widget.channels.isNotEmpty) {
       setState(() => _open = true);
       widget.onOpenChanged?.call(true);
     }
@@ -136,77 +131,128 @@ class _LiveChannelLayerState extends State<LiveChannelLayer> {
 
   void _handleSelect(int index) {
     widget.onSelect(index);
-    _close();
   }
 
   @override
   Widget build(BuildContext context) {
-    // §35 方案 A：画中画下整层直通（不留热区，不会误弹）。
-    final active = widget.enabled && widget.channels.isNotEmpty;
+    // §35 方案 A：画中画下整层直通（不留热区，不会误弹）；全屏时临时隐藏边栏。
+    // 直播页频道未加载（空）时仍挂边栏，先显示空态占位。
+    final active = widget.enabled && !widget.fullScreenHidden;
     return LayoutBuilder(
       builder: (context, constraints) {
         _layoutWidth = constraints.maxWidth;
         final width = _drawerWidth;
         // 停用时也保持同一个 Stack、child 固定在第一位：结构一变整个播放器
         // （画面、顶栏胶囊的菜单状态）都会被卸载重建。
-        return Stack(
-            fit: StackFit.expand,
-            children: [
-              widget.child,
-              if (active) ..._buildOverlays(width),
-            ],
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (active)
+              AnimatedContainer(
+                duration: _open ? AppMotion.enter : AppMotion.exit,
+                curve: AppMotion.ease,
+                width: _open ? width : _collapsedWidth,
+                child: _open
+                    ? (widget.channels.isEmpty
+                        ? const _LoadingChannelPlaceholder()
+                        : _LiveChannelDrawer(
+                            channels: widget.channels,
+                            currentIndex: widget.currentIndex,
+                            favoriteKeys: widget.favoriteKeys,
+                            open: _open,
+                            onSelect: _handleSelect,
+                            onManage: widget.onManage,
+                            onRequestClose: _close,
+                            onCollapse: _close,
+                            sourceNav: widget.sourceNav,
+                          ))
+                    : _CollapseRail(onExpand: _openDrawer),
+              ),
+            Expanded(child: widget.child),
+          ],
         );
       },
     );
   }
+}
 
-  List<Widget> _buildOverlays(double width) {
-    return [
-      // 热区与工具栏错开；错误态保持可达，也不会挡住返回 / 播放按钮。
-      if (!_open && widget.canOpen)
-        Positioned(
-          key: const ValueKey('live-channel-hotzone'),
-          left: 0,
-          top: widget.hotzoneInsets.top,
-          bottom: widget.hotzoneInsets.bottom,
-          width: _hotzoneWidth,
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: _openDrawer,
+/// 频道栏收起后的窄条：点击重新展开频道栏。
+class _CollapseRail extends StatelessWidget {
+  final VoidCallback onExpand;
+
+  const _CollapseRail({required this.onExpand});
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+        child: Container(
+          decoration: BoxDecoration(
+            color: palette.playerChrome,
+            border: Border(
+              right: BorderSide(
+                color: palette.playerText.withValues(alpha: 0.12),
+                width: 1,
+              ),
+            ),
           ),
-        ),
-      // 抽屉打开时铺一层透明遮罩：点空白处只收起抽屉，
-      // 不会穿透成播放 / 暂停或唤出工具栏。
-      if (_open)
-        Positioned.fill(
-          child: GestureDetector(
-            key: const ValueKey('live-channel-barrier'),
-            behavior: HitTestBehavior.opaque,
-            onTap: _close,
-          ),
-        ),
-      AnimatedPositioned(
-        duration: _open ? AppMotion.enter : AppMotion.exit,
-        curve: AppMotion.ease,
-        left: _open ? 0 : -width,
-        top: 0,
-        bottom: 0,
-        width: width,
-        child: IgnorePointer(
-          ignoring: !_open,
-          child: _LiveChannelDrawer(
-            channels: widget.channels,
-            currentIndex: widget.currentIndex,
-            favoriteKeys: widget.favoriteKeys,
-            open: _open,
-            onSelect: _handleSelect,
-            onManage: widget.onManage,
-            onRequestClose: _close,
-            sourceNav: widget.sourceNav,
+          child: Center(
+            child: IconButton(
+              icon: Icon(Icons.chevron_right_rounded,
+                  size: 18, color: palette.playerText.withValues(alpha: 0.85)),
+              tooltip: '展开频道栏',
+              onPressed: onExpand,
+            ),
           ),
         ),
       ),
-    ];
+    );
+  }
+}
+
+/// 频道尚未加载完成时的左栏空态占位：留出边栏宽度，提示正在加载。
+class _LoadingChannelPlaceholder extends StatelessWidget {
+  const _LoadingChannelPlaceholder();
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+        child: Container(
+          decoration: BoxDecoration(
+            color: palette.playerChrome,
+            border: Border(
+              right: BorderSide(
+                color: palette.playerText.withValues(alpha: 0.12),
+                width: 1,
+              ),
+            ),
+          ),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.live_tv_rounded,
+                    size: 22,
+                    color: palette.playerText.withValues(alpha: 0.55)),
+                const SizedBox(height: AppSpacing.sm),
+                Text(
+                  '正在加载直播频道…',
+                  style: TextStyle(
+                    color: palette.playerText.withValues(alpha: 0.55),
+                    fontSize: AppType.caption,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -229,6 +275,7 @@ class _LiveChannelDrawer extends StatefulWidget {
   final ValueChanged<int> onSelect;
   final VoidCallback onManage;
   final VoidCallback onRequestClose;
+  final VoidCallback? onCollapse;
   final LiveSourceNav? sourceNav;
 
   const _LiveChannelDrawer({
@@ -239,6 +286,7 @@ class _LiveChannelDrawer extends StatefulWidget {
     required this.onSelect,
     required this.onManage,
     required this.onRequestClose,
+    this.onCollapse,
     this.sourceNav,
   });
 
@@ -663,6 +711,19 @@ class _LiveChannelDrawerState extends State<_LiveChannelDrawer> {
               ],
             ),
           ),
+          if (widget.onCollapse != null)
+            FocusOutline(
+              radius: AppRadii.pill,
+              child: IconButton(
+                icon: Icon(
+                  Icons.chevron_left_rounded,
+                  size: 18,
+                  color: palette.playerText.withValues(alpha: 0.85),
+                ),
+                tooltip: '收起频道栏',
+                onPressed: widget.onCollapse,
+              ),
+            ),
           FocusOutline(
             radius: AppRadii.pill,
             child: IconButton(

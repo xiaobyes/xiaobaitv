@@ -6,6 +6,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:path/path.dart' as p;
 import 'package:flutter/foundation.dart' show mapEquals;
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/services.dart' show LogicalKeyboardKey;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'ui/desktop/dialogs/cancellable_load_dialog.dart';
@@ -91,11 +92,11 @@ import 'ui/desktop/catalog/douban_poster_image.dart';
 import 'ui/desktop/catalog/poster_image.dart';
 import 'ui/desktop/catalog/site_information_dialog.dart';
 import 'ui/desktop/catalog/vod_detail_dialog.dart';
-import 'ui/desktop/catalog/vod_grid_view.dart';
 import 'ui/desktop/catalog/vod_grid_skeleton.dart';
 import 'ui/desktop/catalog/vod_list_view.dart';
 import 'ui/desktop/home/home_search_page.dart';
 import 'ui/desktop/home/netflix_home_view.dart';
+import 'ui/desktop/home/home_top_bar.dart';
 import 'ui/desktop/catalog/search_site_groups.dart';
 import 'ui/desktop/catalog/search_site_bar.dart';
 import 'ui/desktop/dialogs/depot_selection_dialog.dart';
@@ -116,7 +117,6 @@ import 'ui/desktop/player/live_danmaku_binding.dart';
 import 'ui/desktop/player/playback_mode_badge.dart';
 import 'ui/desktop/settings/about_update_section.dart';
 import 'ui/desktop/settings/settings_page.dart';
-import 'ui/desktop/shell/desktop_sidebar.dart';
 import 'ui/desktop/widgets/app_message.dart';
 import 'ui/desktop/widgets/desktop_window_frame.dart';
 import 'ui/desktop/widgets/dialog_drag_strip.dart';
@@ -2328,9 +2328,38 @@ void showConfigDialog(BuildContext context, WidgetRef ref) {
   );
 }
 
-/// 打开设置中心
-void openSettingsPage(WidgetRef ref) {
+/// 打开设置中心（与历史 / 收藏一致的居中弹窗，固定 780×580）
+void openSettingsPage(BuildContext context, WidgetRef ref) {
   ref.read(settingsPageOpenProvider.notifier).state = true;
+  final playerEngine = ref.read(playerEngineProvider);
+  showAppDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => SettingsPage(
+      companionSpiderApi: ref.read(siteApiProvider).companionSpiderApi,
+      liveRepository: ref.read(liveRepositoryProvider),
+      playerSettingsApplication: playerEngine.settingsApplication,
+      playerEngine: playerEngine,
+      configRepository: ref.read(configRepositoryProvider),
+      settingsRepository: ref.read(settingsRepositoryProvider),
+      cacheMaintenance: ref.read(cacheMaintenanceProvider),
+      epgRepository: ref.read(epgRepositoryProvider),
+      dataBackupService: ref.read(dataBackupServiceProvider),
+      wallpaperStore: ref.read(wallpaperStoreProvider),
+      isPlaybackActive: () => ref.read(activePlaySpecProvider) != null,
+      onResetAll: () => _resetAllSettingsAndRestart(ref),
+      onClose: () {
+        ref.read(settingsPageOpenProvider.notifier).state = false;
+        ref.read(autoLineSwitchProvider).resumePendingAttempt();
+        Navigator.of(context).maybePop();
+      },
+      onAddConfig: (pageContext) => showAppDialog<void>(
+        context: pageContext,
+        builder: (_) =>
+            ConfigDialog(repository: ref.read(configRepositoryProvider)),
+      ),
+    ),
+  );
 }
 
 /// 首页「明暗」入口：深色 ⇄ 浅色互换并落盘。
@@ -3951,6 +3980,12 @@ class XiaobaiTvApp extends ConsumerWidget {
     return MaterialApp(
       title: '小白 TV',
       debugShowCheckedModeBanner: false,
+      locale: const Locale('zh', 'CN'),
+      supportedLocales: const [Locale('zh', 'CN'), Locale('en', 'US')],
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+      ],
       theme: buildAppTheme(
           brightness: Brightness.light, palette: AppPalette.light),
       darkTheme:
@@ -3993,11 +4028,6 @@ class XiaobaiTvApp extends ConsumerWidget {
             child: Builder(
               builder: (ctx) {
                 final searchBridge = ref.watch(homeSearchBridgeProvider);
-                // 侧栏开关在窗口标题栏：状态与主界面共用同一外观偏好。
-                final appearance = ref
-                        .watch(appearancePreferencesProvider)
-                        .valueOrNull ??
-                    ref.read(settingsRepositoryProvider).appearancePreferences;
                 return DesktopWindowFrame(
                   windowManager: windowMgr,
                   background: WallpaperBackdrop(
@@ -4008,7 +4038,7 @@ class XiaobaiTvApp extends ConsumerWidget {
                   activeSiteName: activeSiteName,
                   activeSiteIcon: activeSiteIcon,
                   activeSiteHeaders: currentSite?.header,
-                  onSettingsPressed: () => openSettingsPage(ref),
+                  onSettingsPressed: () => openSettingsPage(ctx, ref),
                   onSiteSelectorPressed: () =>
                       showSiteSelectorDialog(innerContext, ref),
                   // 2.1.3 版式：标题栏不再放搜索框 / 刷新 / 设置齿轮，
@@ -4018,43 +4048,6 @@ class XiaobaiTvApp extends ConsumerWidget {
                     showSettings: showSettings,
                     // 壁纸已经提到 DesktopWindowFrame 的整窗底层（标题栏也要透出来）。
                     background: null,
-                    settingsView: showSettings
-                        ? SettingsPage(
-                            companionSpiderApi:
-                                ref.read(siteApiProvider).companionSpiderApi,
-                            liveRepository: ref.read(liveRepositoryProvider),
-                            playerSettingsApplication:
-                                playerEngine.settingsApplication,
-                            playerEngine: playerEngine,
-                            configRepository:
-                                ref.read(configRepositoryProvider),
-                            settingsRepository:
-                                ref.read(settingsRepositoryProvider),
-                            cacheMaintenance:
-                                ref.read(cacheMaintenanceProvider),
-                            epgRepository: ref.read(epgRepositoryProvider),
-                            dataBackupService:
-                                ref.read(dataBackupServiceProvider),
-                            wallpaperStore: ref.read(wallpaperStoreProvider),
-                            isPlaybackActive: () =>
-                                ref.read(activePlaySpecProvider) != null,
-                            onResetAll: () => _resetAllSettingsAndRestart(ref),
-                            onClose: () {
-                              ref
-                                  .read(settingsPageOpenProvider.notifier)
-                                  .state = false;
-                              ref
-                                  .read(autoLineSwitchProvider)
-                                  .resumePendingAttempt();
-                            },
-                            onAddConfig: (pageContext) => showAppDialog<void>(
-                              context: pageContext,
-                              builder: (_) => ConfigDialog(
-                                  repository:
-                                      ref.read(configRepositoryProvider)),
-                            ),
-                          )
-                        : null,
                     mainView: const DesktopMainView(),
                     playerView: activePlaySpec == null &&
                             !liveEntryLoading &&
@@ -4303,6 +4296,7 @@ class XiaobaiTvApp extends ConsumerWidget {
                                                 ? null
                                                 : () => unawaited(
                                                     _switchLiveChannel(ref, 1)),
+                                            isLive: livePage,
                                             liveChannels: liveChannels,
                                             liveCurrentIndex:
                                                 livePlayingIndex < 0
@@ -4612,9 +4606,6 @@ class WallpaperBackdrop extends ConsumerStatefulWidget {
 }
 
 class _WallpaperBackdropState extends ConsumerState<WallpaperBackdrop> {
-  String? _fileName;
-  Future<String?>? _resolved;
-
   @override
   void initState() {
     super.initState();
@@ -4636,27 +4627,6 @@ class _WallpaperBackdropState extends ConsumerState<WallpaperBackdrop> {
   int? _cacheWidth(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
     return width <= 0 ? null : width.clamp(1, 2560).round();
-  }
-
-  /// 2.1.x 式壁纸寻址：http(s) 走网络图，其余当作本地图片路径。
-  /// 网络图不直接交给 [Image.network]（多数壁纸站有防盗链，直连会静默失败），
-  /// 而是用带 UA / Referer 的 HTTP 抓字节，这一点对齐 2.1.3 的主进程图片代理。
-  Widget _wallpaperImage(String source, int? cacheWidth) {
-    final lower = source.toLowerCase();
-    if (lower.startsWith('http://') || lower.startsWith('https://')) {
-      return _NetworkWallpaperView(
-        key: ValueKey('wallpaper-${wallpaperReloadTick.value}-$source'),
-        source: source,
-        cacheWidth: cacheWidth,
-      );
-    }
-    return Image.file(
-      File(source),
-      fit: BoxFit.cover,
-      filterQuality: FilterQuality.medium,
-      cacheWidth: cacheWidth,
-      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-    );
   }
 
   @override
@@ -4710,57 +4680,6 @@ class _WallpaperBackdropState extends ConsumerState<WallpaperBackdrop> {
         ),
         widget.child,
       ],
-    );
-  }
-}
-
-/// 网络壁纸：HTTP 抓字节（带 UA / Referer）+ 内存解码，避开防盗链导致的静默失败。
-class _NetworkWallpaperView extends StatefulWidget {
-  final String source;
-  final int? cacheWidth;
-
-  const _NetworkWallpaperView(
-      {super.key, required this.source, required this.cacheWidth});
-
-  @override
-  State<_NetworkWallpaperView> createState() => _NetworkWallpaperViewState();
-}
-
-class _NetworkWallpaperViewState extends State<_NetworkWallpaperView> {
-  Future<Uint8List>? _future;
-
-  @override
-  void initState() {
-    super.initState();
-    _future = _load();
-  }
-
-  /// 用户地址失败（域名挂了 / 防盗链 / 不是图片）时自动回退 Bing 每日壁纸，
-  /// 卡片上留一条提示，避免又是「点了没反应」。
-  Future<Uint8List> _load() async {
-    try {
-      return await fetchWallpaperBytes(widget.source);
-    } catch (_) {
-      return fetchBingWallpaperBytes(note: '该壁纸地址加载失败，已临时回退 Bing 每日壁纸');
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FutureBuilder<Uint8List>(
-      future: _future,
-      builder: (context, snapshot) {
-        final bytes = snapshot.data;
-        if (bytes == null) return const SizedBox.shrink();
-        return Image.memory(
-          bytes,
-          fit: BoxFit.cover,
-          filterQuality: FilterQuality.medium,
-          cacheWidth: widget.cacheWidth,
-          gaplessPlayback: true,
-          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-        );
-      },
     );
   }
 }
@@ -4906,8 +4825,6 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
   String? _errorMessage;
   bool _isSearching = false;
 
-  /// 首页「搜索」入口打开的搜索页（大搜索框 + 热词），与网格搜索态解耦。
-  bool _searchPageOpen = false;
   ({Site site, VodItem item, Map<String, String> extend})? _folderRoot;
   final _folderBrowserKey = GlobalKey<CatalogFolderBrowserState>();
   double _folderReturnOffset = 0;
@@ -5807,18 +5724,20 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
   /// 搜索：聚合开时逐站增量渲染（先完成先显示）；聚合关时仅检索当前站源（不受支持时明确提示且不发起请求）
   /// 首页「搜索」方块：打开搜索页（大输入框 + 热词），不依赖标题栏搜索框。
   void _openSearchPage() {
-    if (_searchPageOpen) return;
-    setState(() => _searchPageOpen = true);
+    showAppDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (_) => HomeSearchPage(
+        controller: _searchController,
+        onSearch: _searchFromPage,
+        onClose: () => Navigator.of(context).maybePop(),
+      ),
+    );
   }
 
-  void _closeSearchPage() {
-    if (!_searchPageOpen) return;
-    setState(() => _searchPageOpen = false);
-  }
-
-  /// 搜索页提交：先收起面板，再走原有搜索流程（结果仍落在网格里）。
+  /// 搜索页提交：先关掉弹窗，再走原有搜索流程（结果仍落在网格里）。
   void _searchFromPage(String keyword) {
-    _closeSearchPage();
+    Navigator.of(context).maybePop();
     _searchController.text = keyword;
     unawaited(_handleSearch(keyword));
   }
@@ -6793,8 +6712,6 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
 
   Widget _buildCatalog(BuildContext context) {
     final palette = context.palette;
-    final appearance = ref.watch(appearancePreferencesProvider).valueOrNull ??
-        ref.read(settingsRepositoryProvider).appearancePreferences;
     ref.listen<Site?>(currentSiteProvider, (_, __) => _synchronizeSite());
     ref.listen<VodConfig>(vodConfigProvider, (_, __) {
       _synchronizeSite();
@@ -6962,6 +6879,26 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
                     : Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          // 顶部常驻栏：LOGO（点击回首页）+ 功能图标按钮，仅点播主界面固定显示。
+                          HomeTopBar(
+                            siteName: ref.watch(currentSiteProvider)?.name,
+                            onHomeTap: () => _onTvNavTap(0),
+                            onHistoryTap: _showHistoryDialog,
+                            onLiveTap: _enterLive,
+                            onSearchTap: _openSearchPage,
+                            onConfigTap: () => showConfigDialog(context, ref),
+                            onSiteTap: () => showSiteSelectorDialog(context, ref),
+                            onLineTap: () => showSourceSwitchDialog(context, ref),
+                            onFavTap: _showFavoritesDialog,
+                            onWallpaperTap: () {
+                              reloadWallpaper();
+                              showAppMessage('已切换下一张壁纸',
+                                  type: AppMessageType.success);
+                            },
+                            onThemeTap: () => toggleDayNightTheme(ref),
+                            onSettingsTap: () => openSettingsPage(context, ref),
+                          ),
+
                           // 原全宽大搜索栏已全面迁移至顶部标题栏 (Netflix 风格紧凑栏)，主内容区直接呈现内容
 
                           // 2. 搜索态：命中站点胶囊（站点名 + 数量）；否则：站源动态分类滚动条
@@ -6994,7 +6931,7 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
                               Padding(
                                 key: const ValueKey('category-filter-section'),
                                 padding: const EdgeInsets.symmetric(
-                                    horizontal: AppSpacing.lg,
+                                    horizontal: 36,
                                     vertical: AppSpacing.md),
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -7099,7 +7036,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
                               _items.isNotEmpty &&
                               _searchNotice != null)
                             Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
+                              padding: const EdgeInsets.only(
+                                  left: 36, right: 36, bottom: 8),
                               child: Row(children: [
                                 Expanded(
                                     child: Text(_searchNotice!,
@@ -7282,7 +7220,7 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
                                                           _showFavoritesDialog,
                                                       onThemeTap: () => toggleDayNightTheme(ref),
                                                       onSettingsTap: () =>
-                                                          openSettingsPage(ref),
+                                                          openSettingsPage(context, ref),
                                                       categoryItemsMap:
                                                           _doubanCategoryItems,
                                                       categories: _categories,
@@ -7389,7 +7327,7 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
                                                           _showFavoritesDialog,
                                                       onThemeTap: () => toggleDayNightTheme(ref),
                                                       onSettingsTap: () =>
-                                                          openSettingsPage(ref),
+                                                          openSettingsPage(context, ref),
                                                     ),
                             ),
                           ),
@@ -7399,15 +7337,6 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
             ],
           ),
         ),
-        // 搜索页：整窗磨砂遮罩 + 大搜索框 + 热词胶囊（点空白 / Esc / 回车都会退出）。
-        if (_searchPageOpen)
-          Positioned.fill(
-            child: HomeSearchPage(
-              controller: _searchController,
-              onSearch: _searchFromPage,
-              onClose: _closeSearchPage,
-            ),
-          ),
       ],
     );
   }

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:ui' show ImageFilter;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,7 +10,6 @@ import 'package:dio/dio.dart' show DioException;
 import '../../../core/companion/companion_process_manager.dart';
 import '../../../core/companion/companion_spider_api.dart';
 import '../../../core/config/models/vod_config.dart';
-import '../../../core/build_info.dart';
 import '../../../core/diagnostics/error_log.dart';
 import '../../../core/danmaku/danmaku_api.dart';
 import '../../../core/danmaku/danmaku_settings.dart';
@@ -21,12 +19,10 @@ import '../../../core/live/live_repository.dart';
 import '../../../core/live/live_source_history.dart';
 import '../../../core/player/models/player_settings.dart';
 import '../../../core/settings/models/appearance_preferences.dart';
-import '../../../core/settings/wallpaper_source.dart';
 import '../../../core/settings/models/external_player_settings.dart';
 import '../../theme/app_icon_assets.dart';
 import '../../theme/app_palette.dart';
 import '../widgets/app_message.dart';
-import '../widgets/app_motion.dart';
 import '../dialogs/app_dialog.dart';
 import '../widgets/focus_ring.dart';
 import '../../theme/app_tokens.dart';
@@ -49,9 +45,6 @@ import '../../../core/settings/settings_repository.dart';
 import '../dialogs/depot_selection_dialog.dart';
 import '../dialogs/escape_closable.dart';
 import '../dialogs/search_site_selection_dialog.dart';
-import '../wallpaper/wallpaper_size_probe.dart';
-import 'about_update_section.dart';
-import 'error_log_dialog.dart';
 import 'site_self_check_dialog.dart';
 import 'source_category_controls.dart';
 import 'source_history_table.dart';
@@ -167,15 +160,6 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   late SettingsSection _section = widget.initialSection;
   final FocusNode _focusNode = FocusNode(debugLabel: 'SettingsPage');
-  bool _reverseSection = false;
-
-  void _selectSection(SettingsSection section) {
-    if (section == _section) return;
-    setState(() {
-      _reverseSection = section.index < _section.index;
-      _section = section;
-    });
-  }
 
   @override
   void initState() {
@@ -197,6 +181,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final palette = context.palette;
     return CallbackShortcuts(
       bindings: {
         const SingleActivator(LogicalKeyboardKey.escape): widget.onClose
@@ -204,44 +189,36 @@ class _SettingsPageState extends State<SettingsPage> {
       child: Focus(
         focusNode: _focusNode,
         autofocus: true,
-        child: ColoredBox(
-          // 2.1.x：设置中心与壁纸共用同一整窗背景，只留一层很淡的暗底，
-          // 让整窗壁纸透上来；打开设置时主视图被 Offstage 隐藏，不会漏出海报。
-          color: context.palette.background.withValues(alpha: 0.30),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
-            child: ClipRRect(
+        child: Dialog(
+          backgroundColor: palette.panel,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadii.lg),
+            side: BorderSide(color: palette.divider, width: 1),
+          ),
+          child: Container(
+            width: 780,
+            height: 580,
+            decoration: BoxDecoration(
+              color: palette.panel,
               borderRadius: BorderRadius.circular(AppRadii.lg),
-              child: BackdropFilter(
-                // 磨砂玻璃：模糊后面的壁纸，文字区域仍然清晰可读。
-                filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: context.palette.panel.withValues(alpha: 0.30),
-                    borderRadius: BorderRadius.circular(AppRadii.lg),
-                    border: Border.all(
-                        color: context.palette.divider.withValues(alpha: 0.7)),
+            ),
+            padding: const EdgeInsets.all(22),
+            child: _SettingsSaveBanner(
+              key: ObjectKey(widget.settingsRepository),
+              repository: widget.settingsRepository,
+              child: Column(
+                children: [
+                  _settingsHeader(context),
+                  _HomeSiteStatusBanner(repository: widget.configRepository),
+                  Expanded(
+                    child: _showIndex
+                        ? _settingsIndex(context)
+                        : _settingsSectionBody(context),
                   ),
-                  clipBehavior: Clip.antiAlias,
-              child: _SettingsSaveBanner(
-                key: ObjectKey(widget.settingsRepository),
-                repository: widget.settingsRepository,
-                child: Column(
-                  children: [
-                    _settingsHeader(context),
-                    _HomeSiteStatusBanner(repository: widget.configRepository),
-                    Expanded(
-                      child: _showIndex
-                          ? _settingsIndex(context)
-                          : _settingsSectionBody(context),
-                    ),
-                  ],
-                ),
+                ],
               ),
             ),
           ),
-        ),
-        ),
         ),
       ),
     );
@@ -275,6 +252,13 @@ class _SettingsPageState extends State<SettingsPage> {
                   fontSize: AppType.h2,
                   fontWeight: FontWeight.bold,
                   color: context.palette.textTitle)),
+          const Spacer(),
+          IconButton(
+            tooltip: '关闭设置',
+            onPressed: widget.onClose,
+            icon: Icon(Icons.close_rounded,
+                size: 22, color: context.palette.textSub),
+          ),
         ],
       ),
     );
@@ -486,73 +470,6 @@ class _SettingsCardTileState extends State<_SettingsCardTile> {
     );
   }
 }
-class _SectionTab extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  const _SectionTab(
-      {required this.icon,
-      required this.label,
-      required this.selected,
-      required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return FocusRing(
-        onTap: onTap,
-        semanticLabel: label,
-        borderRadius: const BorderRadius.all(Radius.circular(AppRadii.md)),
-        child: Material(
-          color: selected ? context.palette.accentWash : Colors.transparent,
-          borderRadius: BorderRadius.circular(AppRadii.md),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(AppRadii.md),
-            // hover 底用语义色板（B6：与主题同源，深浅两端都可辨）
-            hoverColor: context.palette.hover,
-            onTap: onTap,
-            child: AnimatedContainer(
-              duration: AppMotion.durationOf(context, AppMotion.exit),
-              curve: AppMotion.ease,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(AppRadii.md),
-                border: Border.all(
-                    color: selected
-                        ? context.palette.accentInk
-                        : Colors.transparent),
-              ),
-              child: Row(
-                children: [
-                  Icon(icon,
-                      size: 18,
-                      color: selected
-                          ? context.palette.accentInk
-                          : context.palette.textSub),
-                  const SizedBox(width: 12),
-                  Flexible(
-                    child: Text(
-                      label,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: AppType.label,
-                        fontWeight: FontWeight.w600,
-                        color: selected
-                            ? context.palette.textTitle
-                            : context.palette.textBody,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ));
-  }
-}
-
 /// 分区通用骨架：标题 + 说明 + 可滚动内容。
 ///
 /// 设置中心改成「一页平铺」后，[embedded]（由 [_EmbeddedSettingsScope] 提供）为
@@ -4718,161 +4635,11 @@ class AppearancePanel extends StatefulWidget {
 }
 
 class _AppearancePanelState extends State<AppearancePanel> {
-  bool _busy = false;
-  String? _message;
-  bool _messageIsError = false;
-
-  void _setMessage(String message, {bool isError = false}) {
-    if (!mounted) return;
-    setState(() {
-      _message = message;
-      _messageIsError = isError;
-    });
-  }
-
-  Future<String?> _pickPath() async {
-    final picker = widget.pickWallpaperPath;
-    if (picker != null) return picker();
-    final file = await openFile(
-      acceptedTypeGroups: const [
-        XTypeGroup(
-            label: '图片', extensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp']),
-      ],
-    );
-    return file?.path;
-  }
-
-  /// 2.1.3 式「壁纸地址」：手填 http(s) 直链或本地图片路径，留空恢复默认。
-  Future<void> _choose() async {
-    if (_busy) return;
-    final controller = TextEditingController(
-        text: widget.settingsRepository.appearancePreferences.wallpaperUrl ?? '');
-    final value = await showAppDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: context.palette.card,
-        title: Text('壁纸地址',
-            style: TextStyle(
-                color: context.palette.textTitle, fontSize: AppType.heading)),
-        content: SizedBox(
-          width: 460,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '支持 http(s) 图片直链或本地图片路径（如 D:\\pics\\wall.jpg）；留空恢复默认背景。',
-                style: TextStyle(
-                    fontSize: AppType.body,
-                    color: context.palette.textSub,
-                    height: 1.5),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                key: const ValueKey('wallpaper-url-field'),
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(
-                    hintText: 'https://.../wall.jpg'),
-                onSubmitted: (v) => Navigator.of(ctx).pop(v),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: Text('取消', style: TextStyle(color: context.palette.textSub)),
-          ),
-          ElevatedButton(
-            key: const ValueKey('wallpaper-url-save'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: context.palette.accent,
-              foregroundColor: Colors.white,
-            ),
-            onPressed: () => Navigator.of(ctx).pop(controller.text),
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-    if (value == null || !mounted) return;
-    setState(() {
-      _busy = true;
-      _message = null;
-    });
-    try {
-      final repo = widget.settingsRepository;
-      final base = repo.appearancePreferences;
-      final trimmed = value.trim();
-      await repo.updateAppearancePreferences(trimmed.isEmpty
-          ? base.withWallpaper(null).withWallpaperUrl(null)
-          : base.withWallpaperUrl(trimmed));
-      _setMessage(trimmed.isEmpty ? '已恢复接口自带壁纸' : '壁纸已保存');
-    } on DataRestorePendingRestartException catch (error) {
-      _setMessage(error.message, isError: true);
-    } catch (_) {
-      _setMessage('壁纸保存失败，请重试', isError: true);
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _restoreDefault() async {
-    if (_busy) return;
-    setState(() {
-      _busy = true;
-      _message = null;
-    });
-    try {
-      final repo = widget.settingsRepository;
-      final base = repo.appearancePreferences;
-      // 2.1.x：清壁纸 = 地址与旧副本一起清，回到接口自带的默认背景。
-      await repo.updateAppearancePreferences(
-          base.withWallpaper(null).withWallpaperUrl(null));
-      _setMessage('已恢复接口自带壁纸');
-    } on DataRestorePendingRestartException catch (error) {
-      _setMessage(error.message, isError: true);
-    } catch (_) {
-      _setMessage('恢复默认失败，请重试', isError: true);
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  /// 刷新壁纸：丢掉图片缓存后重新拉当前地址（2.1.3 的 ⟳ 按钮）。
-  Future<void> _refreshWallpaper() async {
-    if (_busy) return;
-    setState(() {
-      _busy = true;
-      _message = null;
-    });
-    try {
-      // 壁纸图层的字节缓存也一起清掉，否则换了地址仍然显示旧图。
-      final cache = PaintingBinding.instance.imageCache;
-      cache.clear();
-      cache.clearLiveImages();
-      reloadWallpaper();
-      _setMessage('正在刷新壁纸…');
-    } catch (_) {
-      _setMessage('壁纸刷新失败，请重试', isError: true);
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
   Future<void> _chooseTheme(AppThemeMode mode) async {
     final current = widget.settingsRepository.appearancePreferences;
     if (current.themeMode == mode) return;
-    try {
-      await widget.settingsRepository
-          .updateAppearancePreferences(current.withThemeMode(mode));
-      _setMessage('已切换主题：${mode.label}');
-    } on DataRestorePendingRestartException catch (error) {
-      _setMessage(error.message, isError: true);
-    } catch (_) {
-      _setMessage('主题切换失败，请重试', isError: true);
-    }
+    await widget.settingsRepository
+        .updateAppearancePreferences(current.withThemeMode(mode));
   }
 
   @override
@@ -5011,289 +4778,6 @@ class _ThemeCard extends StatelessWidget {
   }
 }
 
-/// 壁纸卡片（2.1.3 版式）：标题 + 当前壁纸地址 + 两个方按钮（恢复默认 / 刷新）。
-///
-/// 地址留空时显示接口自带壁纸；点地址本身可以改地址。
-class _WallpaperCard extends StatelessWidget {
-  final AppearancePreferences preferences;
-  final WallpaperStore store;
-  final String? sourceWallpaper;
-  final bool busy;
-  final String? message;
-  final bool messageIsError;
-  final VoidCallback onChoose;
-  final VoidCallback onReset;
-  final VoidCallback onRefresh;
-
-  const _WallpaperCard({
-    required this.preferences,
-    required this.store,
-    this.sourceWallpaper,
-    required this.busy,
-    required this.message,
-    required this.messageIsError,
-    required this.onChoose,
-    required this.onReset,
-    required this.onRefresh,
-  });
-
-  String _address() {
-    final url = preferences.wallpaperUrl;
-    if (url != null && url.isNotEmpty) return url;
-    final fileName = preferences.wallpaperFileName;
-    if (fileName != null && fileName.isNotEmpty) return '本地图片：$fileName';
-    final source = sourceWallpaper?.trim();
-    if (source != null && source.isNotEmpty) return source;
-    return '未设置（默认 Bing 每日壁纸）';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = context.palette;
-    final overridden = preferences.hasWallpaper;
-    return _card(
-      context,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('壁纸',
-                        style: TextStyle(
-                            fontSize: AppType.heading,
-                            fontWeight: FontWeight.w800,
-                            color: palette.textTitle)),
-                    const SizedBox(height: 8),
-                    MouseRegion(
-                      cursor: SystemMouseCursors.click,
-                      child: GestureDetector(
-                        key: const ValueKey('appearance-pick'),
-                        onTap: busy ? null : onChoose,
-                        behavior: HitTestBehavior.opaque,
-                        child: Text(
-                          _address(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                              fontSize: AppType.body,
-                              color: palette.textSub),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              _WallpaperIconButton(
-                key: const ValueKey('appearance-reset'),
-                icon: Icons.home_rounded,
-                tooltip: '恢复默认（接口自带壁纸）',
-                onPressed: (busy || !overridden) ? null : onReset,
-              ),
-              const SizedBox(width: 8),
-              _WallpaperIconButton(
-                key: const ValueKey('appearance-refresh'),
-                icon: Icons.refresh_rounded,
-                tooltip: '刷新壁纸',
-                onPressed: busy ? null : onRefresh,
-              ),
-            ],
-          ),
-          // 状态行：本地操作提示 + 壁纸图层的真实加载结果（加载中 / 失败原因）。
-          ValueListenableBuilder<WallpaperStatus>(
-            valueListenable: wallpaperStatus,
-            builder: (context, status, _) {
-              final String? text;
-              final bool isError;
-              final bool isNote;
-              if (status.loading) {
-                text = '壁纸加载中…';
-                isError = false;
-                isNote = false;
-              } else if (status.error != null) {
-                text = '壁纸加载失败：${status.error}';
-                isError = true;
-                isNote = false;
-              } else if (status.note != null) {
-                text = status.note;
-                isError = true;
-                isNote = true;
-              } else if (status.url != null) {
-                text = message ?? '壁纸来源：${status.url}';
-                isError = false;
-                isNote = false;
-              } else {
-                text = message;
-                isError = messageIsError;
-                isNote = false;
-              }
-              if (text == null) return const SizedBox.shrink();
-              return Padding(
-                padding: const EdgeInsets.only(top: 10),
-                child: Text(
-                  text,
-                  style: TextStyle(
-                      fontSize: AppType.body,
-                      color: isError
-                          ? (isNote ? palette.textSub : palette.warning)
-                          : palette.success),
-                ),
-              );
-            },
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// 壁纸卡片右侧的方形图标按钮（描边 + 悬停高亮），照着 2.1.3 那两个按钮做。
-class _WallpaperIconButton extends StatefulWidget {
-  final IconData icon;
-  final String tooltip;
-  final VoidCallback? onPressed;
-
-  const _WallpaperIconButton({
-    super.key,
-    required this.icon,
-    required this.tooltip,
-    required this.onPressed,
-  });
-
-  @override
-  State<_WallpaperIconButton> createState() => _WallpaperIconButtonState();
-}
-
-class _WallpaperIconButtonState extends State<_WallpaperIconButton> {
-  bool _hover = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = context.palette;
-    final enabled = widget.onPressed != null;
-    return Tooltip(
-      message: widget.tooltip,
-      child: MouseRegion(
-        cursor: enabled
-            ? SystemMouseCursors.click
-            : SystemMouseCursors.basic,
-        onEnter: (_) => setState(() => _hover = enabled),
-        onExit: (_) => setState(() => _hover = false),
-        child: GestureDetector(
-          onTap: widget.onPressed,
-          behavior: HitTestBehavior.opaque,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(
-              color: _hover
-                  ? palette.accentInk.withValues(alpha: 0.18)
-                  : palette.raised.withValues(alpha: 0.62),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                  color: _hover ? palette.accentInk : palette.border),
-            ),
-            child: Icon(widget.icon,
-                size: 20,
-                color: enabled ? palette.textTitle : palette.textDim),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// 壁纸预览：自己缓存解析 Future，避免每次 rebuild 都新建 Future 造成无限重建。
-class _WallpaperPreview extends StatefulWidget {
-  final String? fileName;
-  final WallpaperStore store;
-
-  const _WallpaperPreview({required this.fileName, required this.store});
-
-  @override
-  State<_WallpaperPreview> createState() => _WallpaperPreviewState();
-}
-
-class _WallpaperPreviewState extends State<_WallpaperPreview> {
-  String? _fileName;
-  Future<String?>? _resolved;
-
-  @override
-  void initState() {
-    super.initState();
-    _fileName = widget.fileName;
-    _resolved = widget.store.resolvePath(_fileName);
-  }
-
-  @override
-  void didUpdateWidget(_WallpaperPreview oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.fileName != _fileName) {
-      _fileName = widget.fileName;
-      _resolved = widget.store.resolvePath(_fileName);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FutureBuilder<String?>(
-      future: _resolved,
-      builder: (context, snapshot) {
-        final path = snapshot.data;
-        final missing = widget.fileName != null &&
-            snapshot.connectionState == ConnectionState.done &&
-            path == null;
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              key: const ValueKey('appearance-preview'),
-              width: 216,
-              height: 122,
-              decoration: BoxDecoration(
-                color: context.palette.background,
-                borderRadius: BorderRadius.circular(AppRadii.sm),
-                border: Border.all(color: context.palette.border),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: path == null
-                  ? Center(
-                      child: Text('默认深色背景',
-                          style: TextStyle(
-                              fontSize: AppType.body,
-                              color: context.palette.textSub)),
-                    )
-                  : Image.file(
-                      File(path),
-                      fit: BoxFit.cover,
-                      cacheWidth: 432,
-                      errorBuilder: (_, __, ___) => Center(
-                        child: Text('默认深色背景',
-                            style: TextStyle(
-                                fontSize: AppType.body,
-                                color: context.palette.textSub)),
-                      ),
-                    ),
-            ),
-            if (missing) ...[
-              const SizedBox(height: 12),
-              Text('壁纸文件已失效，请重新选择',
-                  style: TextStyle(
-                      fontSize: AppType.body, color: context.palette.warning)),
-            ],
-          ],
-        );
-      },
-    );
-  }
-}
-
 /// 关于（2026-10-27 重构）：顶部居中 logo / 名字 / 介绍，下面一列行，不再分卡片。
 ///
 /// 行：当前版本 · 构建信息（Build Time / Commit Hash）·
@@ -5333,9 +4817,6 @@ class AboutPanel extends StatefulWidget {
 class _AboutPanelState extends State<AboutPanel> {
   String? _version;
   bool _versionFailed = false;
-  bool _resetting = false;
-
-  ErrorLog get _log => widget.errorLog ?? ErrorLog.instance;
 
   @override
   void initState() {
@@ -5379,80 +4860,6 @@ class _AboutPanelState extends State<AboutPanel> {
     } catch (_) {
       return false;
     }
-  }
-
-  /// 点击：应用内查看本次运行的错误日志（关闭软件即清空，不落盘）。
-  void _openErrorLog() => unawaited(showErrorLogDialog(context, _log));
-
-  /// 长按：清除。
-  void _clearErrorLog() {
-    _log.clear();
-    showAppMessage('错误日志已清除', type: AppMessageType.success);
-  }
-
-  Future<void> _confirmReset() async {
-    final onResetAll = widget.onResetAll;
-    if (onResetAll == null || _resetting) return;
-    final confirmed = await showAppDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: context.palette.card,
-        title: Text('重置所有设置',
-            style: TextStyle(
-                color: context.palette.textTitle, fontSize: AppType.heading)),
-        content: Text(
-          '将清空小白 TV 的全部数据并恢复到刚安装的状态：所有设置、播放历史、收藏、配置源、直播源、'
-          '片头片尾记录、壁纸、本地备份与缓存，以及各站源里的网盘登录状态（需重新扫码）都会被删除，且无法恢复。\n应用随后自动重启。是否继续？',
-          style: TextStyle(
-              color: context.palette.textBody,
-              fontSize: AppType.label,
-              height: 1.5),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: Text('取消', style: TextStyle(color: context.palette.textSub)),
-          ),
-          ElevatedButton(
-            key: const ValueKey('about-reset-confirm'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: context.palette.danger,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(AppRadii.sm)),
-            ),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('全部清空并重启'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    setState(() => _resetting = true);
-    try {
-      await onResetAll();
-    } catch (e) {
-      if (mounted) showAppMessage('重置失败：$e', type: AppMessageType.error);
-    } finally {
-      if (mounted) setState(() => _resetting = false);
-    }
-  }
-
-  Widget _buildInfo(BuildContext context) {
-    final style = TextStyle(
-      fontSize: AppType.body,
-      color: context.palette.textSub,
-      fontFeatures: const [FontFeature.tabularFigures()],
-      height: 1.6,
-    );
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-      child: SelectableText(
-        'Build Time: ${BuildInfo.buildTime}',
-        key: const ValueKey('about-build-info'),
-        style: style,
-      ),
-    );
   }
 
   /// 关于页的极简行：左标签、右值，无虚线引导线。

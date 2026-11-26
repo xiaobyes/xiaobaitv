@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 
@@ -95,8 +93,6 @@ String _punycode(String label) {
   const base = 36;
   const tMin = 1;
   const tMax = 26;
-  const skew = 38;
-  const damp = 700;
   const initialBias = 72;
   const initialN = 128;
   final codePoints = label.runes.toList();
